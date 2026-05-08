@@ -23,10 +23,9 @@ cat > "$MANIFEST" <<JSON
   "type": "stdio",
   "path": "$BINARY",
   "allowed_origins": [
-    "chrome-extension://REPLACE_WITH_EXTENSION_ID/"
+    "chrome-extension://fbhbfpbbnppjecdlinnannjojfeimljb/"
   ]
 }
 JSON
 
 echo "Registered: $MANIFEST"
-echo "Replace REPLACE_WITH_EXTENSION_ID with actual extension ID after loading."
