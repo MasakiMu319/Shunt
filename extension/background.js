@@ -78,7 +78,7 @@ async function getOrCreateTabGroup(windowId) {
     if (tab.groupId === chrome.tabGroups.TAB_GROUP_ID_NONE) continue;
     try {
       const group = await chrome.tabGroups.get(tab.groupId);
-      if (group && group.title === "agent-browser") {
+      if (group && group.title === "Shunt") {
         tabGroupId = group.id;
         groupWindowId = windowId;
         return group.id;
@@ -89,7 +89,7 @@ async function getOrCreateTabGroup(windowId) {
   // 3. Create new group with anchor tab
   const tab = await chrome.tabs.create({ windowId, url: "about:blank", active: false });
   const gid = await chrome.tabs.group({ tabIds: [tab.id], createProperties: { windowId } });
-  await chrome.tabGroups.update(gid, { collapsed: true, title: "agent-browser" });
+  await chrome.tabGroups.update(gid, { collapsed: true, title: "Shunt" });
   tabGroupId = gid;
   groupWindowId = windowId;
   return gid;
