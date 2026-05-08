@@ -227,12 +227,15 @@ async function h_click(params) {
     }
     // Mouse move before click to position cursor
     await cdpSendCommand(tabId, "Input.dispatchMouseEvent", {
-      type: "mouseMoved", x, y, modifiers: 0,
+      type: "mouseMoved", x, y, button: "none", buttons: 0, modifiers: 0,
     });
+    const btn = button || "left";
+    const btnMask = btn === "left" ? 1 : btn === "right" ? 2 : 4;
     const args = {
       type: "mousePressed",
       x, y,
-      button: button || "left",
+      button: btn,
+      buttons: btnMask,
       clickCount: clickCount || 1,
       modifiers: 0,
     };

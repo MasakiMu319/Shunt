@@ -219,33 +219,49 @@ def cmd_snapshot(rpc, args):
 
 def cmd_click_ref(rpc, args):
     """Click element by backend node ID (from snapshot [ref=eN])"""
-    # Step 1: resolve backend node
-    resolve = rpc.call("executeCdp", {
+    # Step 1: scroll into view
+    rpc.call("executeCdp", {
         "tabId": args.tab_id,
-        "method": "DOM.resolveNode",
+        "method": "DOM.scrollIntoViewIfNeeded",
         "params": {"backendNodeId": args.node_id},
     })
-    object_id = resolve.get("result", {}).get("object", {}).get("objectId")
-    if not object_id:
-        print("Error: could not resolve node", file=sys.stderr)
-        sys.exit(1)
 
-    # Step 2: get box model
-    box = rpc.call("executeCdp", {
+    # Step 2: get content quads (viewport-relative CSS pixels)
+    quads_res = rpc.call("executeCdp", {
         "tabId": args.tab_id,
-        "method": "DOM.getBoxModel",
-        "params": {"objectId": object_id},
+        "method": "DOM.getContentQuads",
+        "params": {"backendNodeId": args.node_id},
     })
-    quad = box.get("result", {}).get("model", {}).get("content")
-    if not quad or len(quad) < 8:
-        print("Error: no box model for node", file=sys.stderr)
-        sys.exit(1)
+    quads = quads_res.get("result", {}).get("quads", [])
+    if not quads:
+        # Fallback: resolveNode → getBoxModel
+        resolve = rpc.call("executeCdp", {
+            "tabId": args.tab_id,
+            "method": "DOM.resolveNode",
+            "params": {"backendNodeId": args.node_id},
+        })
+        object_id = resolve.get("result", {}).get("object", {}).get("objectId")
+        if not object_id:
+            print("Error: could not resolve node", file=sys.stderr)
+            sys.exit(1)
+        box = rpc.call("executeCdp", {
+            "tabId": args.tab_id,
+            "method": "DOM.getBoxModel",
+            "params": {"objectId": object_id},
+        })
+        quad = box.get("result", {}).get("model", {}).get("content")
+        if not quad or len(quad) < 8:
+            print("Error: no box model for node", file=sys.stderr)
+            sys.exit(1)
+        x = round((quad[0] + quad[4]) / 2)
+        y = round((quad[1] + quad[5]) / 2)
+    else:
+        # Content quad: [x1,y1,x2,y2,x3,y3,x4,y4]
+        q = quads[0]
+        x = round((q[0] + q[4]) / 2)
+        y = round((q[1] + q[5]) / 2)
 
-    # Step 3: center point
-    x = round((quad[0] + quad[4]) / 2)
-    y = round((quad[1] + quad[5]) / 2)
-
-    # Step 4: click
+    # Step 3: click
     result = rpc.call("click", {"tabId": args.tab_id, "x": x, "y": y})
     print(json.dumps(result))
 
