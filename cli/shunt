@@ -201,16 +201,14 @@ def cmd_snapshot(rpc, args):
             roots.append(n)
 
     def walk(node, depth):
-        if node.get("ignored"):
-            return
+        # Walk children even if node is ignored (just don't print it)
         indent = "  " * min(depth, 8)
-        role = node.get("role", {}).get("value", "?")
-        name = node.get("name", {}).get("value", "")
-        ref = ""
-        if node.get("backendDOMNodeId"):
-            ref = f" [ref=e{node['backendDOMNodeId']}]"
-        name_str = f" \"{name[:80]}\"" if name else ""
-        print(f"{indent}{role}{name_str}{ref}")
+        if not node.get("ignored"):
+            role = node.get("role", {}).get("value", "?")
+            name = node.get("name", {}).get("value", "")
+            ref = f" [ref=e{node['backendDOMNodeId']}]" if node.get("backendDOMNodeId") else ""
+            name_str = f" \"{name[:80]}\"" if name else ""
+            print(f"{indent}{role}{name_str}{ref}")
         for cid in node.get("childIds", []):
             child = node_map.get(cid)
             if child:
