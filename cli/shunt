@@ -148,20 +148,59 @@ def cmd_click(rpc, args):
     print(json.dumps(result))
 
 def cmd_type(rpc, args):
-    result = rpc.call("type", {
+    """Type text via JS dispatch (CDP Input.dispatchKeyEvent broken in Helium)"""
+    escaped = args.text.replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n")
+    result = rpc.call("executeCdp", {
         "tabId": args.tab_id,
-        "text": args.text,
+        "method": "Runtime.evaluate",
+        "params": {
+            "expression": f"""
+            (() => {{
+                const text = '{escaped}';
+                const el = document.activeElement;
+                if (!el) return 'no-active-element';
+                const tag = el.tagName.toLowerCase();
+                if (tag === 'input' || tag === 'textarea') {{
+                    const start = el.selectionStart ?? el.value.length;
+                    el.value = el.value.slice(0, start) + text + el.value.slice(el.selectionEnd ?? start);
+                    el.selectionStart = el.selectionEnd = start + text.length;
+                    el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                    el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                    return 'typed:' + tag;
+                }}
+                if (el.isContentEditable) {{
+                    el.focus();
+                    document.execCommand('insertText', false, text);
+                    return 'typed:contenteditable';
+                }}
+                return 'typed:unknown-' + tag;
+            }})()
+            """,
+            "returnByValue": True,
+        },
     })
+    result["text"] = args.text
     print(json.dumps(result))
 
 def cmd_scroll(rpc, args):
-    result = rpc.call("scroll", {
+    """Scroll via JS (CDP Input.dispatchMouseEvent wheel broken in Helium)"""
+    result = rpc.call("executeCdp", {
         "tabId": args.tab_id,
-        "x": args.x,
-        "y": args.y,
-        "deltaX": args.dx,
-        "deltaY": args.dy,
+        "method": "Runtime.evaluate",
+        "params": {
+            "expression": f"""
+            (() => {{
+                const before = [window.scrollX, window.scrollY];
+                window.scrollBy({{ left: {args.dx}, top: {args.dy}, behavior: 'instant' }});
+                const after = [window.scrollX, window.scrollY];
+                return JSON.stringify({{ from: before, to: after, delta: [after[0]-before[0], after[1]-before[1]] }});
+            }})()
+            """,
+            "returnByValue": True,
+        },
     })
+    result["deltaX"] = args.dx
+    result["deltaY"] = args.dy
     print(json.dumps(result))
 
 def cmd_user_tabs(rpc, args):
