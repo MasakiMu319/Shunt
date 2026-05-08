@@ -60,23 +60,36 @@ async function withTabLock(tabId, fn) {
 // ═══════════════════════════════════════════════════════════════
 
 async function getOrCreateTabGroup(windowId) {
-  // If group exists and is in this window, reuse it
+  // 1. Fast path: in-memory cache hit (same session, same window)
   if (tabGroupId != null && groupWindowId === windowId) {
     try {
       await chrome.tabGroups.get(tabGroupId);
       return tabGroupId;
     } catch {
-      // Group no longer exists, fall through
       tabGroupId = null;
       groupWindowId = null;
     }
   }
 
-  // Create a new group in this window with an anchor tab
+  // 2. Search for existing agent-browser group in this window
+  //    (handles service worker restart, window switch, etc.)
+  const allTabs = await chrome.tabs.query({ windowId });
+  for (const tab of allTabs) {
+    if (tab.groupId === chrome.tabGroups.TAB_GROUP_ID_NONE) continue;
+    try {
+      const group = await chrome.tabGroups.get(tab.groupId);
+      if (group && group.title === "agent-browser") {
+        tabGroupId = group.id;
+        groupWindowId = windowId;
+        return group.id;
+      }
+    } catch { /* group deleted, continue */ }
+  }
+
+  // 3. Create new group with anchor tab
   const tab = await chrome.tabs.create({ windowId, url: "about:blank", active: false });
   const gid = await chrome.tabs.group({ tabIds: [tab.id], createProperties: { windowId } });
   await chrome.tabGroups.update(gid, { collapsed: true, title: "agent-browser" });
-  // Keep anchor tab — empty groups are auto-deleted
   tabGroupId = gid;
   groupWindowId = windowId;
   return gid;
