@@ -7,7 +7,9 @@
     "debugger",
     "tabs",
     "tabGroups",
-    "nativeMessaging"
+    "nativeMessaging",
+    "storage",
+    "scripting"
   ],
   "background": {
     "service_worker": "background.js"

@@ -1,0 +1,265 @@
+#!/usr/bin/env python3
+"""
+Shunt CLI — browser automation client
+JSON-RPC 2.0 over Unix socket to shunt-host → Extension
+"""
+
+import json
+import socket
+import sys
+import os
+import argparse
+import select
+
+SOCKET_PATH = "/tmp/shunt.sock"
+
+# ── JSON-RPC Client ──
+
+class ShuntRPC:
+    def __init__(self):
+        self._id = 1
+        self._sock = None
+
+    def _connect(self):
+        if self._sock:
+            return self._sock
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.connect(SOCKET_PATH)
+        self._sock = s
+        return s
+
+    def _close(self):
+        if self._sock:
+            try:
+                self._sock.close()
+            except:
+                pass
+            self._sock = None
+
+    def call(self, method, params=None):
+        """Send request and wait for matching response."""
+        s = self._connect()
+        req_id = self._id
+        self._id += 1
+
+        msg = {"jsonrpc": "2.0", "method": method, "id": req_id}
+        if params is not None:
+            msg["params"] = params
+
+        s.sendall((json.dumps(msg) + "\n").encode())
+
+        f = s.makefile("r")
+        while True:
+            line = f.readline()
+            if not line:
+                raise ConnectionError("Socket closed before response")
+            resp = json.loads(line)
+            if resp.get("id") == req_id:
+                if "error" in resp:
+                    err = resp["error"]
+                    raise RuntimeError(f"[{err.get('code', '?')}] {err.get('message', 'unknown')}")
+                return resp.get("result")
+
+    def wait_for_event(self, tab_id, event_method, timeout=30):
+        """Block until a cdpEvent notification matches tabId + method."""
+        s = self._connect()
+        f = s.makefile("r")
+        s.settimeout(timeout)
+        try:
+            while True:
+                line = f.readline()
+                if not line:
+                    raise ConnectionError("Socket closed")
+                resp = json.loads(line)
+                if resp.get("method") == "cdpEvent":
+                    params = resp.get("params", {})
+                    if params.get("tabId") == tab_id and params.get("method") == event_method:
+                        return params.get("params", {})
+        except socket.timeout:
+            raise TimeoutError(f"Timeout waiting for {event_method} on tab {tab_id}")
+
+
+# ── CLI Commands ──
+
+def cmd_create_tab(rpc, args):
+    result = rpc.call("createTab")
+    print(json.dumps(result))
+
+def cmd_close_tab(rpc, args):
+    result = rpc.call("closeTab", {"tabId": args.tab_id})
+    print(json.dumps(result))
+
+def cmd_attach(rpc, args):
+    result = rpc.call("attach", {"tabId": args.tab_id})
+    print(json.dumps(result))
+
+def cmd_detach(rpc, args):
+    result = rpc.call("detach", {"tabId": args.tab_id})
+    print(json.dumps(result))
+
+def cmd_cdp(rpc, args):
+    cdp_params = None
+    if args.params:
+        try:
+            cdp_params = json.loads(args.params)
+        except json.JSONDecodeError:
+            # Try as raw string (for simple values)
+            cdp_params = args.params
+    result = rpc.call("executeCdp", {
+        "tabId": args.tab_id,
+        "method": args.method,
+        "params": cdp_params,
+    })
+    print(json.dumps(result))
+
+def cmd_screenshot(rpc, args):
+    params = {"tabId": args.tab_id}
+    if args.format:
+        params["format"] = args.format
+    if args.quality is not None:
+        params["quality"] = args.quality
+    if args.clip:
+        params["clip"] = args.clip
+    result = rpc.call("screenshot", params)
+    # Output base64 data to stdout
+    print(result.get("data", ""))
+
+def cmd_click(rpc, args):
+    result = rpc.call("click", {
+        "tabId": args.tab_id,
+        "x": args.x,
+        "y": args.y,
+    })
+    print(json.dumps(result))
+
+def cmd_type(rpc, args):
+    result = rpc.call("type", {
+        "tabId": args.tab_id,
+        "text": args.text,
+    })
+    print(json.dumps(result))
+
+def cmd_scroll(rpc, args):
+    result = rpc.call("scroll", {
+        "tabId": args.tab_id,
+        "x": args.x,
+        "y": args.y,
+        "deltaX": args.dx,
+        "deltaY": args.dy,
+    })
+    print(json.dumps(result))
+
+def cmd_user_tabs(rpc, args):
+    result = rpc.call("getUserTabs")
+    print(json.dumps(result, indent=2))
+
+def cmd_activate(rpc, args):
+    result = rpc.call("activateTab", {"tabId": args.tab_id})
+    print(json.dumps(result))
+
+def cmd_session(rpc, args):
+    result = rpc.call("getSession")
+    print(json.dumps(result, indent=2))
+
+def cmd_finalize(rpc, args):
+    keep = args.tab_ids if args.tab_ids else []
+    result = rpc.call("finalizeTabs", {"keep": keep})
+    print(json.dumps(result))
+
+def cmd_wait_for(rpc, args):
+    try:
+        result = rpc.wait_for_event(args.tab_id, args.event, timeout=args.timeout)
+        print(json.dumps(result))
+    except (TimeoutError, ConnectionError) as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(1)
+
+
+# ── Main ──
+
+def main():
+    parser = argparse.ArgumentParser(prog="shunt", description="Browser automation via Helium Extension")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("create-tab", help="Create a new background tab")
+    p.set_defaults(func=cmd_create_tab)
+
+    p = sub.add_parser("close-tab", help="Close a tab (detaches debugger if attached)")
+    p.add_argument("tab_id", type=int)
+    p.set_defaults(func=cmd_close_tab)
+
+    p = sub.add_parser("attach", help="Attach debugger to a tab (enables Page, Network, Runtime domains)")
+    p.add_argument("tab_id", type=int)
+    p.set_defaults(func=cmd_attach)
+
+    p = sub.add_parser("detach", help="Detach debugger from a tab")
+    p.add_argument("tab_id", type=int)
+    p.set_defaults(func=cmd_detach)
+
+    p = sub.add_parser("cdp", help="Execute a CDP command on an attached tab")
+    p.add_argument("tab_id", type=int)
+    p.add_argument("method")
+    p.add_argument("params", nargs="?", help="JSON params string")
+    p.set_defaults(func=cmd_cdp)
+
+    p = sub.add_parser("screenshot", help="Capture screenshot (base64 PNG to stdout)")
+    p.add_argument("tab_id", type=int)
+    p.add_argument("--format", choices=["png", "jpeg"], default="png")
+    p.add_argument("--quality", type=int, default=None)
+    p.add_argument("--clip", type=json.loads, default=None, help='JSON clip rect {"x":0,"y":0,"width":100,"height":100,"scale":1}')
+    p.set_defaults(func=cmd_screenshot)
+
+    p = sub.add_parser("click", help="Click at coordinates")
+    p.add_argument("tab_id", type=int)
+    p.add_argument("x", type=int)
+    p.add_argument("y", type=int)
+    p.set_defaults(func=cmd_click)
+
+    p = sub.add_parser("type", help="Type text via CDP Input.dispatchKeyEvent")
+    p.add_argument("tab_id", type=int)
+    p.add_argument("text")
+    p.set_defaults(func=cmd_type)
+
+    p = sub.add_parser("scroll", help="Scroll by delta (default: 500px down)")
+    p.add_argument("tab_id", type=int)
+    p.add_argument("--x", type=int, default=0)
+    p.add_argument("--y", type=int, default=0)
+    p.add_argument("--dx", type=int, default=0)
+    p.add_argument("--dy", type=int, default=500)
+    p.set_defaults(func=cmd_scroll)
+
+    p = sub.add_parser("user-tabs", help="List all user tabs")
+    p.set_defaults(func=cmd_user_tabs)
+
+    p = sub.add_parser("activate", help="Activate/focus a tab")
+    p.add_argument("tab_id", type=int)
+    p.set_defaults(func=cmd_activate)
+
+    p = sub.add_parser("session", help="Show current session state")
+    p.set_defaults(func=cmd_session)
+
+    p = sub.add_parser("finalize", help="Close all agent tabs except the ones specified")
+    p.add_argument("tab_ids", nargs="*", type=int, help="Tab IDs to keep")
+    p.set_defaults(func=cmd_finalize)
+
+    p = sub.add_parser("wait-for", help="Wait for a CDP event on a tab")
+    p.add_argument("tab_id", type=int)
+    p.add_argument("event", help="CDP event method (e.g. Page.loadEventFired)")
+    p.add_argument("--timeout", type=int, default=30)
+    p.set_defaults(func=cmd_wait_for)
+
+    args = parser.parse_args()
+    rpc = ShuntRPC()
+    try:
+        args.func(rpc, args)
+    except RuntimeError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    except ConnectionRefusedError:
+        print("Error: Can't connect to shunt-host. Is the Extension loaded and running?", file=sys.stderr)
+        sys.exit(1)
+    finally:
+        rpc._close()
+
+if __name__ == "__main__":
+    main()
