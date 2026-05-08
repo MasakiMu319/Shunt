@@ -172,6 +172,24 @@ def cmd_find_element(rpc, args):
     result = rpc.call("findElement", params)
     print(json.dumps(result, indent=2))
 
+
+def cmd_axtree(rpc, args):
+    params = {"tabId": args.tab_id, "compact": not args.full, "maxDepth": args.depth}
+    result = rpc.call("getAxtree", params)
+    if args.compact or not args.full:
+        for line in result.get("nodes", []):
+            print(line)
+    else:
+        print(json.dumps(result, indent=2))
+
+def cmd_resolve(rpc, args):
+    result = rpc.call("resolveNode", {"tabId": args.tab_id, "backendNodeId": args.node_id})
+    print(json.dumps(result, indent=2))
+
+def cmd_click_ref(rpc, args):
+    result = rpc.call("clickRef", {"tabId": args.tab_id, "backendNodeId": args.node_id})
+    print(json.dumps(result, indent=2))
+
 def cmd_get_text(rpc, args):
     params = {"tabId": args.tab_id}
     if args.max_length:
@@ -264,7 +282,24 @@ def main():
     p.add_argument("--selector", help="CSS selector")
     p.set_defaults(func=cmd_find_element)
 
+    p = sub.add_parser("axtree", help="Get accessibility tree (compact by default)")
+    p.add_argument("tab_id", type=int)
+    p.add_argument("-f", "--full", action="store_true", help="Full JSON output")
+    p.add_argument("-d", "--depth", type=int, default=4, help="Max depth (default 4)")
+    p.set_defaults(func=cmd_axtree)
+
+    p = sub.add_parser("resolve", help="Resolve backend node ID to coordinates")
+    p.add_argument("tab_id", type=int)
+    p.add_argument("node_id", type=int, help="Backend DOM node ID (from axtree ref)")
+    p.set_defaults(func=cmd_resolve)
+
+    p = sub.add_parser("click-ref", help="Click element by backend node ID")
+    p.add_argument("tab_id", type=int)
+    p.add_argument("node_id", type=int, help="Backend DOM node ID (from axtree ref)")
+    p.set_defaults(func=cmd_click_ref)
+
     p = sub.add_parser("get-text", help="Extract visible page text")
+
     p.add_argument("tab_id", type=int)
     p.add_argument("--max-length", type=int, default=10000)
     p.set_defaults(func=cmd_get_text)
