@@ -262,6 +262,82 @@ def cmd_move(rpc, args):
     print(json.dumps(result))
 
 
+def cmd_drag(rpc, args):
+    """Drag along a path via JS dispatch (CDP Input.dispatchMouseEvent broken in Helium)"""
+    path = args.path  # list of (x,y) tuples, e.g. [(100,200),(300,200)]
+    pts_json = json.dumps(path)
+    result = rpc.call("executeCdp", {
+        "tabId": args.tab_id,
+        "method": "Runtime.evaluate",
+        "params": {
+            "expression": f"""
+            (() => {{
+                const path = {pts_json};
+                if (path.length < 2) return 'drag-needs-2+points';
+                let el = document.elementFromPoint(path[0][0], path[0][1]);
+                if (!el) return 'no-element-at-start';
+                const opts = (x,y,buttons) => ({{
+                    bubbles: true, cancelable: true, clientX: x, clientY: y,
+                    button: 0, buttons: buttons, view: window
+                }});
+                el.dispatchEvent(new MouseEvent('pointerdown', opts(path[0][0], path[0][1], 1)));
+                el.dispatchEvent(new MouseEvent('mousedown', opts(path[0][0], path[0][1], 1)));
+                for (let i = 1; i < path.length - 1; i++) {{
+                    el = document.elementFromPoint(path[i][0], path[i][1]);
+                    if (el) {{
+                        el.dispatchEvent(new MouseEvent('pointermove', opts(path[i][0], path[i][1], 1)));
+                        el.dispatchEvent(new MouseEvent('mousemove', opts(path[i][0], path[i][1], 1)));
+                    }}
+                }}
+                const last = path[path.length - 1];
+                el = document.elementFromPoint(last[0], last[1]);
+                if (el) {{
+                    el.dispatchEvent(new MouseEvent('pointermove', opts(last[0], last[1], 1)));
+                    el.dispatchEvent(new MouseEvent('mousemove', opts(last[0], last[1], 1)));
+                    el.dispatchEvent(new MouseEvent('pointerup', opts(last[0], last[1], 0)));
+                    el.dispatchEvent(new MouseEvent('mouseup', opts(last[0], last[1], 0)));
+                }}
+                return 'dragged:' + path.length + 'pts';
+            }})()
+            """,
+            "returnByValue": True,
+        },
+    })
+    result["path"] = path
+    print(json.dumps(result))
+
+
+def cmd_download_media(rpc, args):
+    """Extract and trigger download of media at coordinates via JS"""
+    result = rpc.call("executeCdp", {
+        "tabId": args.tab_id,
+        "method": "Runtime.evaluate",
+        "params": {
+            "expression": f"""
+            (() => {{
+                const el = document.elementFromPoint({args.x}, {args.y});
+                if (!el) return JSON.stringify({{ error: 'no-element' }});
+                const media = el.closest?.('img, video, audio, source, a[href]') ?? el;
+                const url = media.currentSrc ?? media.src ?? media.href ?? '';
+                if (!url) return JSON.stringify({{ error: 'no-media-url', tag: media.tagName }});
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = '';
+                a.style.display = 'none';
+                document.body.appendChild(a);
+                a.click();
+                setTimeout(() => a.remove(), 100);
+                return JSON.stringify({{ url: url, tag: media.tagName }});
+            }})()
+            """,
+            "returnByValue": True,
+        },
+    })
+    result["x"] = args.x
+    result["y"] = args.y
+    print(json.dumps(result))
+
+
 def cmd_scroll(rpc, args):
     """Scroll via JS (CDP Input.dispatchMouseEvent wheel broken in Helium)"""
     result = rpc.call("executeCdp", {
@@ -482,6 +558,17 @@ def main():
     p.add_argument("y", type=int)
     p.set_defaults(func=cmd_move)
 
+    p = sub.add_parser("drag", help="Drag along a path of coordinates")
+    p.add_argument("tab_id", type=int)
+    p.add_argument("path", help='Path as "x1,y1 x2,y2 x3,y3 ..." (e.g. "100,200 300,200 300,400")')
+    p.set_defaults(func=cmd_drag)
+
+    p = sub.add_parser("download-media", help="Extract and download media at coordinates")
+    p.add_argument("tab_id", type=int)
+    p.add_argument("x", type=int)
+    p.add_argument("y", type=int)
+    p.set_defaults(func=cmd_download_media)
+
     p = sub.add_parser("type", help="Type text via CDP Input.dispatchKeyEvent")
     p.add_argument("tab_id", type=int)
     p.add_argument("text")
@@ -540,6 +627,14 @@ def main():
     p.set_defaults(func=cmd_wait_for)
 
     args = parser.parse_args()
+    # Pre-process drag path: "100,200 300,400" → [(100,200),(300,400)]
+    if args.command == "drag":
+        pts = []
+        for p in args.path.split():
+            x, y = p.split(",")
+            pts.append((int(x), int(y)))
+        args.path = pts
+
     rpc = ShuntRPC()
     try:
         args.func(rpc, args)
