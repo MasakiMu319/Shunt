@@ -308,7 +308,7 @@ def cmd_drag(rpc, args):
 
 
 def cmd_download_media(rpc, args):
-    """Extract and trigger download of media at coordinates via JS"""
+    """Extract and trigger download of media at coordinates via JS fetch→blob→click"""
     result = rpc.call("executeCdp", {
         "tabId": args.tab_id,
         "method": "Runtime.evaluate",
@@ -320,13 +320,17 @@ def cmd_download_media(rpc, args):
                 const media = el.closest?.('img, video, audio, source, a[href]') ?? el;
                 const url = media.currentSrc ?? media.src ?? media.href ?? '';
                 if (!url) return JSON.stringify({{ error: 'no-media-url', tag: media.tagName }});
-                const a = document.createElement('a');
-                a.href = url;
-                a.download = '';
-                a.style.display = 'none';
-                document.body.appendChild(a);
-                a.click();
-                setTimeout(() => a.remove(), 100);
+                fetch(url)
+                    .then(r => r.blob())
+                    .then(blob => {{
+                        const a = document.createElement('a');
+                        a.href = URL.createObjectURL(blob);
+                        a.download = url.split('/').pop().split('?')[0] || 'download';
+                        document.body.appendChild(a);
+                        a.click();
+                        setTimeout(() => {{ document.body.removeChild(a); URL.revokeObjectURL(a.href); }}, 5000);
+                    }})
+                    .catch(e => console.error('download error:', e));
                 return JSON.stringify({{ url: url, tag: media.tagName }});
             }})()
             """,
@@ -335,6 +339,25 @@ def cmd_download_media(rpc, args):
     })
     result["x"] = args.x
     result["y"] = args.y
+    print(json.dumps(result))
+
+
+def cmd_history(rpc, args):
+    """Navigate history via JS (CDP Page.navigateToHistoryEntry unreliable in Helium)"""
+    if args.direction == "back":
+        expr = "history.back(); setTimeout(() => {}, 100); 'back-ok'"
+    elif args.direction == "forward":
+        expr = "history.forward(); setTimeout(() => {}, 100); 'forward-ok'"
+    elif args.direction == "goto":
+        expr = f"history.go({args.index}); setTimeout(() => {{}}, 100); 'goto-ok'"
+    else:
+        expr = f"JSON.stringify({{length:history.length,current:{args.tab_id}}})"
+    result = rpc.call("executeCdp", {
+        "tabId": args.tab_id,
+        "method": "Runtime.evaluate",
+        "params": {"expression": expr, "returnByValue": True},
+    })
+    result["direction"] = args.direction
     print(json.dumps(result))
 
 
@@ -568,6 +591,12 @@ def main():
     p.add_argument("x", type=int)
     p.add_argument("y", type=int)
     p.set_defaults(func=cmd_download_media)
+
+    p = sub.add_parser("history", help="Navigate browser history (back / forward / goto / state)")
+    p.add_argument("tab_id", type=int)
+    p.add_argument("direction", nargs="?", default="state", help="back | forward | goto | state")
+    p.add_argument("index", nargs="?", type=int, default=0, help="For goto: relative index (e.g. -1 for back, 1 for forward)")
+    p.set_defaults(func=cmd_history)
 
     p = sub.add_parser("type", help="Type text via CDP Input.dispatchKeyEvent")
     p.add_argument("tab_id", type=int)
