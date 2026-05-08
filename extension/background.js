@@ -309,6 +309,17 @@ async function h_getSession() {
   };
 }
 
+async function h_getStatus() {
+  return {
+    connected: true,
+    nativeHost: port ? "connected" : "disconnected",
+    attachedTabs: Array.from(attachedTabs),
+    attachedCount: attachedTabs.size,
+    groupWindowId,
+    tabGroupId,
+  };
+}
+
 async function h_finalizeTabs(params) {
   const { keep } = params;
   const keepSet = new Set(keep || []);
@@ -413,9 +424,9 @@ const handlers = {
   getUserTabs:   h_getUserTabs,
   activateTab:   h_activateTab,
   getSession:    h_getSession,
+  getStatus:     h_getStatus,
   finalizeTabs:  h_finalizeTabs,
   findElement:   h_findElement,
-  getPageText:   h_getPageText,
   getPageText:   h_getPageText,
 };
 

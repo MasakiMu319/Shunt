@@ -24,7 +24,19 @@ class ShuntRPC:
         if self._sock:
             return self._sock
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        s.connect(SOCKET_PATH)
+        s.settimeout(5)
+        try:
+            s.connect(SOCKET_PATH)
+        except FileNotFoundError:
+            raise RuntimeError(
+                "Shunt not running. Is Helium open with Shunt extension loaded?\n"
+                "  open -a Helium → chrome://extensions → Load Unpacked → .../Shunt/extension"
+            )
+        except ConnectionRefusedError:
+            raise RuntimeError(
+                "Shunt host refusing connections. Try reloading the extension.\n"
+                "  chrome://extensions → Shunt → Reload"
+            )
         self._sock = s
         return s
 
@@ -396,6 +408,40 @@ def cmd_session(rpc, args):
     print(json.dumps(result, indent=2))
 
 
+def cmd_status(rpc, args):
+    """Connection health check — reports full link state"""
+    import sys
+    try:
+        result = rpc.call("getStatus")
+    except RuntimeError as e:
+        print(f"SHUNT: OFFLINE")
+        print(f"  error: {e}")
+        sys.exit(1)
+
+    status = result if isinstance(result, dict) else {}
+    print("SHUNT: CONNECTED")
+    print(f"  native host: {status.get('nativeHost', '?')}")
+    print(f"  group window: {status.get('groupWindowId', '?')}")
+    print(f"  tab group:    {status.get('tabGroupId', '?')}")
+    attached = status.get('attachedTabs', [])
+    print(f"  attached ({len(attached)}): {attached or 'none'}")
+
+    # Also show all user tabs
+    try:
+        tabs_res = rpc.call("getUserTabs")
+        tabs = tabs_res.get('tabs', []) if isinstance(tabs_res, dict) else []
+        print(f"  browser tabs ({len(tabs)}):")
+        for t in tabs[:10]:
+            url = str(t.get('url', ''))[:60]
+            mark = " ◀ active" if t.get('active') else ""
+            attached_mark = " [attached]" if t.get('id') in attached else ""
+            print(f"    {t['id']} {url}{attached_mark}{mark}")
+        if len(tabs) > 10:
+            print(f"    ... ({len(tabs) - 10} more)")
+    except RuntimeError:
+        print("  (tabs: error fetching)")
+
+
 def cmd_find_element(rpc, args):
     params = {"tabId": args.tab_id}
     if args.text:
@@ -621,6 +667,9 @@ def main():
 
     p = sub.add_parser("session", help="Show current session state")
     p.set_defaults(func=cmd_session)
+
+    p = sub.add_parser("status", help="Connection health check — full link state")
+    p.set_defaults(func=cmd_status)
 
     p = sub.add_parser("find-element", help="Find DOM element by text or CSS selector")
     p.add_argument("tab_id", type=int)
