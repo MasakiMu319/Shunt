@@ -516,8 +516,17 @@ function connect() {
 // ═══════════════════════════════════════════════════════════════
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  handleRequest(msg).then(sendResponse).catch((err) => {
-    sendResponse({ jsonrpc: "2.0", id: msg.id, error: { code: -1, message: err.message } });
+  const { id, method } = msg;
+  if (id == null) { sendResponse(null); return false; }
+  const handler = handlers[method];
+  if (!handler) {
+    sendResponse({ jsonrpc: "2.0", id, error: { code: -1, message: "Method not found: " + method } });
+    return false;
+  }
+  handler(msg.params).then((result) => {
+    sendResponse({ jsonrpc: "2.0", id, result });
+  }).catch((err) => {
+    sendResponse({ jsonrpc: "2.0", id, error: { code: -2, message: err.message || String(err) } });
   });
   return true; // async
 });
