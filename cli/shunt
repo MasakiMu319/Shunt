@@ -125,11 +125,26 @@ def cmd_screenshot(rpc, args):
     print(result.get("data", ""))
 
 def cmd_click(rpc, args):
-    result = rpc.call("click", {
+    """Click at viewport coordinates via JS dispatch (CDP Input.dispatchMouseEvent broken in Helium)"""
+    result = rpc.call("executeCdp", {
         "tabId": args.tab_id,
-        "x": args.x,
-        "y": args.y,
+        "method": "Runtime.evaluate",
+        "params": {
+            "expression": f"""
+            (() => {{
+                const el = document.elementFromPoint({args.x}, {args.y});
+                if (!el) return 'no-element at ({args.x},{args.y})';
+                ['mousedown','mouseup','click','pointerdown','pointerup'].forEach(t => {{
+                    el.dispatchEvent(new MouseEvent(t, {{ bubbles: true, cancelable: true, clientX: {args.x}, clientY: {args.y}, button: 0 }}));
+                }});
+                return 'clicked:' + el.tagName;
+            }})()
+            """,
+            "returnByValue": True,
+        },
     })
+    result["x"] = args.x
+    result["y"] = args.y
     print(json.dumps(result))
 
 def cmd_type(rpc, args):
@@ -218,51 +233,68 @@ def cmd_snapshot(rpc, args):
         walk(root, 0)
 
 def cmd_click_ref(rpc, args):
-    """Click element by backend node ID (from snapshot [ref=eN])"""
+    """Click element by backend node ID via JS dispatch (bypasses Helium Input bug)"""
     # Step 1: scroll into view
-    rpc.call("executeCdp", {
+    _ = rpc.call("executeCdp", {
         "tabId": args.tab_id,
         "method": "DOM.scrollIntoViewIfNeeded",
         "params": {"backendNodeId": args.node_id},
     })
 
-    # Step 2: get content quads (viewport-relative CSS pixels)
+    # Step 2: get content quads
     quads_res = rpc.call("executeCdp", {
         "tabId": args.tab_id,
         "method": "DOM.getContentQuads",
         "params": {"backendNodeId": args.node_id},
     })
     quads = quads_res.get("result", {}).get("quads", [])
-    if not quads:
+    if quads:
+        q = quads[0]
+        x = round((q[0] + q[4]) / 2)
+        y = round((q[1] + q[5]) / 2)
+    else:
         # Fallback: resolveNode → getBoxModel
         resolve = rpc.call("executeCdp", {
             "tabId": args.tab_id,
             "method": "DOM.resolveNode",
             "params": {"backendNodeId": args.node_id},
         })
-        object_id = resolve.get("result", {}).get("object", {}).get("objectId")
-        if not object_id:
+        obj_id = resolve.get("result", {}).get("object", {}).get("objectId")
+        if not obj_id:
             print("Error: could not resolve node", file=sys.stderr)
             sys.exit(1)
         box = rpc.call("executeCdp", {
             "tabId": args.tab_id,
             "method": "DOM.getBoxModel",
-            "params": {"objectId": object_id},
+            "params": {"objectId": obj_id},
         })
         quad = box.get("result", {}).get("model", {}).get("content")
         if not quad or len(quad) < 8:
-            print("Error: no box model for node", file=sys.stderr)
+            print("Error: no box model", file=sys.stderr)
             sys.exit(1)
         x = round((quad[0] + quad[4]) / 2)
         y = round((quad[1] + quad[5]) / 2)
-    else:
-        # Content quad: [x1,y1,x2,y2,x3,y3,x4,y4]
-        q = quads[0]
-        x = round((q[0] + q[4]) / 2)
-        y = round((q[1] + q[5]) / 2)
 
-    # Step 3: click
-    result = rpc.call("click", {"tabId": args.tab_id, "x": x, "y": y})
+    # Step 3: click via JS (CDP Input.dispatchMouseEvent doesn't generate DOM events in Helium)
+    result = rpc.call("executeCdp", {
+        "tabId": args.tab_id,
+        "method": "Runtime.evaluate",
+        "params": {
+            "expression": f"""
+            (() => {{
+                const el = document.elementFromPoint({x}, {y});
+                if (!el) return 'no-element';
+                ['mousedown','mouseup','click','pointerdown','pointerup'].forEach(t => {{
+                    el.dispatchEvent(new MouseEvent(t, {{ bubbles: true, cancelable: true, clientX: {x}, clientY: {y}, button: 0 }}));
+                }});
+                return 'clicked:' + el.tagName;
+            }})()
+            """,
+            "returnByValue": True,
+        },
+    })
+    result["x"] = x
+    result["y"] = y
     print(json.dumps(result))
 
 def cmd_finalize(rpc, args):
