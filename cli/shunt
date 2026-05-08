@@ -169,8 +169,23 @@ def cmd_type(rpc, args):
                     return 'typed:' + tag;
                 }}
                 if (el.isContentEditable) {{
-                    el.focus();
-                    document.execCommand('insertText', false, text);
+                    // execCommand triggers React re-render → double insert.
+                    // Instead: write to the text node directly, then dispatch input.
+                    const sel = window.getSelection();
+                    if (sel.rangeCount) {{
+                        const range = sel.getRangeAt(0);
+                        range.deleteContents();
+                        range.insertNode(document.createTextNode(text));
+                        // Collapse after inserted node
+                        range.collapse(false);
+                        sel.removeAllRanges();
+                        sel.addRange(range);
+                    }} else {{
+                        // No selection: append
+                        el.appendChild(document.createTextNode(text));
+                    }}
+                    el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                    el.dispatchEvent(new Event('change', {{ bubbles: true }}));
                     return 'typed:contenteditable';
                 }}
                 return 'typed:unknown-' + tag;
