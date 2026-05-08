@@ -171,6 +171,10 @@ async function h_attach(params) {
     await cdpSendCommand(tabId, "Page.enable");
     await cdpSendCommand(tabId, "Network.enable");
     await cdpSendCommand(tabId, "Runtime.enable");
+    // Inject cursor overlay so agent can "see" its clicks
+    try {
+      await chrome.scripting.executeScript({ target: { tabId }, files: ["overlay.js"] });
+    } catch { /* may fail on chrome:// pages */ }
     return { tabId, attached: true };
   });
 }
@@ -223,6 +227,11 @@ async function h_click(params) {
     if (!attachedTabs.has(tabId)) {
       throw new Error("Tab " + tabId + " not attached.");
     }
+    // Show cursor overlay so agent can see where it clicked
+    try {
+      await chrome.tabs.sendMessage(tabId, { from: "shunt", action: "showCursor", x, y });
+    } catch { /* content script not ready, non-fatal */ }
+
     const args = {
       type: "mousePressed",
       x, y,
@@ -322,6 +331,83 @@ async function h_finalizeTabs(params) {
 
   return { kept: Array.from(keepSet) };
 }
+async function h_findElement(params) {
+  const { tabId, text, selector } = params;
+  return withTabLock(tabId, async () => {
+    if (!attachedTabs.has(tabId)) throw new Error("Tab " + tabId + " not attached.");
+
+    let expression;
+    if (text) {
+      const escaped = text.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+      expression = `(() => {
+        const els = document.querySelectorAll("a,button,input,label,span,div,p,h1,h2,h3,h4,h5,h6,li,td,th");
+        for (const el of els) {
+          if (el.textContent && el.textContent.includes("${escaped}")) {
+            const r = el.getBoundingClientRect();
+            if (r.width > 0 && r.height > 0) {
+              el.setAttribute("data-shunt-found", "true");
+              return { x: r.left + r.width/2, y: r.top + r.height/2, width: r.width, height: r.height, tag: el.tagName, text: el.textContent.substring(0, 120) };
+            }
+          }
+        }
+        return null;
+      })()`;
+    } else if (selector) {
+      const escaped = selector.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+      expression = `(() => {
+        const el = document.querySelector("${escaped}");
+        if (!el) return null;
+        const r = el.getBoundingClientRect();
+        if (r.width === 0 || r.height === 0) return null;
+        el.setAttribute("data-shunt-found", "true");
+        return { x: r.left + r.width/2, y: r.top + r.height/2, width: r.width, height: r.height, tag: el.tagName, text: el.textContent?.substring(0, 120) || "" };
+      })()`;
+    } else {
+      throw new Error("Must provide text or selector");
+    }
+
+    const result = await cdpSendCommand(tabId, "Runtime.evaluate", {
+      expression,
+      returnByValue: true,
+      awaitPromise: false,
+    });
+
+    const el = result.result?.value || null;
+
+    // Highlight if found
+    if (el) {
+      try {
+        await chrome.tabs.sendMessage(tabId, { from: "shunt", action: "highlight", rect: { x: el.x - el.width/2, y: el.y - el.height/2, width: el.width, height: el.height } });
+      } catch { /* ok */ }
+    }
+
+    return { tabId, element: el };
+  });
+}
+
+async function h_getPageText(params) {
+  const { tabId, maxLength } = params || {};
+  return withTabLock(tabId, async () => {
+    if (!attachedTabs.has(tabId)) throw new Error("Tab " + tabId + " not attached.");
+    const result = await cdpSendCommand(tabId, "Runtime.evaluate", {
+      expression: "document.body?.innerText || ''",
+      returnByValue: true,
+    });
+    let text = result.result?.value || '';
+    const limit = maxLength || 10000;
+    if (text.length > limit) text = text.substring(0, limit) + '...';
+    return { tabId, text, truncated: text.length >= limit };
+  });
+}
+
+async function h_clearHighlights(params) {
+  const { tabId } = params;
+  try {
+    await chrome.tabs.sendMessage(tabId, { from: "shunt", action: "clearHighlights" });
+  } catch { /* ok */ }
+  return { tabId };
+}
+
 
 // ═══════════════════════════════════════════════════════════════
 // Handler router
@@ -341,6 +427,9 @@ const handlers = {
   activateTab:   h_activateTab,
   getSession:    h_getSession,
   finalizeTabs:  h_finalizeTabs,
+  findElement:   h_findElement,
+  getPageText:   h_getPageText,
+  clearHighlights: h_clearHighlights,
 };
 
 async function handleRequest(msg) {

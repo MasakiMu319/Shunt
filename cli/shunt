@@ -162,6 +162,27 @@ def cmd_session(rpc, args):
     result = rpc.call("getSession")
     print(json.dumps(result, indent=2))
 
+
+def cmd_find_element(rpc, args):
+    params = {"tabId": args.tab_id}
+    if args.text:
+        params["text"] = args.text
+    if args.selector:
+        params["selector"] = args.selector
+    result = rpc.call("findElement", params)
+    print(json.dumps(result, indent=2))
+
+def cmd_get_text(rpc, args):
+    params = {"tabId": args.tab_id}
+    if args.max_length:
+        params["maxLength"] = args.max_length
+    result = rpc.call("getPageText", params)
+    print(result.get("text", ""))
+
+def cmd_clear_highlights(rpc, args):
+    result = rpc.call("clearHighlights", {"tabId": args.tab_id})
+    print(json.dumps(result))
+
 def cmd_finalize(rpc, args):
     keep = args.tab_ids if args.tab_ids else []
     result = rpc.call("finalizeTabs", {"keep": keep})
@@ -240,7 +261,23 @@ def main():
     p = sub.add_parser("session", help="Show current session state")
     p.set_defaults(func=cmd_session)
 
+    p = sub.add_parser("find-element", help="Find DOM element by text or CSS selector")
+    p.add_argument("tab_id", type=int)
+    p.add_argument("--text", help="Text content to search for (partial match)")
+    p.add_argument("--selector", help="CSS selector")
+    p.set_defaults(func=cmd_find_element)
+
+    p = sub.add_parser("get-text", help="Extract visible page text")
+    p.add_argument("tab_id", type=int)
+    p.add_argument("--max-length", type=int, default=10000)
+    p.set_defaults(func=cmd_get_text)
+
+    p = sub.add_parser("clear-highlights", help="Remove all element highlight overlays")
+    p.add_argument("tab_id", type=int)
+    p.set_defaults(func=cmd_clear_highlights)
+
     p = sub.add_parser("finalize", help="Close all agent tabs except the ones specified")
+
     p.add_argument("tab_ids", nargs="*", type=int, help="Tab IDs to keep")
     p.set_defaults(func=cmd_finalize)
 
