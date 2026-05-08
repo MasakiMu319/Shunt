@@ -157,6 +157,7 @@ def cmd_activate(rpc, args):
     result = rpc.call("activateTab", {"tabId": args.tab_id})
     print(json.dumps(result))
 
+
 def cmd_session(rpc, args):
     result = rpc.call("getSession")
     print(json.dumps(result, indent=2))
@@ -234,6 +235,7 @@ def main():
     p = sub.add_parser("activate", help="Activate/focus a tab")
     p.add_argument("tab_id", type=int)
     p.set_defaults(func=cmd_activate)
+
 
     p = sub.add_parser("session", help="Show current session state")
     p.set_defaults(func=cmd_session)

@@ -32,30 +32,8 @@ function sendNotification(method, params) {
 
 const attachedTabs = new Set();
 const tabLocks = new Map();       // tabId => Promise chain
-let backgroundWindowId = null;
 let tabGroupId = null;
-
-// ═══════════════════════════════════════════════════════════════
-// Session persistence (survive service worker restarts)
-// ═══════════════════════════════════════════════════════════════
-
-async function persistSession() {
-  await chrome.storage.session.set({
-    shuntWindowId: backgroundWindowId,
-  });
-}
-
-async function restoreSession() {
-  const s = await chrome.storage.session.get(["shuntWindowId"]);
-  if (s.shuntWindowId != null) {
-    try {
-      await chrome.windows.get(s.shuntWindowId);
-      backgroundWindowId = s.shuntWindowId;
-    } catch {
-      backgroundWindowId = null;
-    }
-  }
-}
+let groupWindowId = null;         // which window the group is in
 
 // ═══════════════════════════════════════════════════════════════
 // Per-tab mutex
@@ -78,35 +56,29 @@ async function withTabLock(tabId, fn) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// Window & tab group management
+// Tab group management — lives in user's current active window
 // ═══════════════════════════════════════════════════════════════
 
-async function getOrCreateWindow() {
-  if (backgroundWindowId != null) {
+async function getOrCreateTabGroup(windowId) {
+  // If group exists and is in this window, reuse it
+  if (tabGroupId != null && groupWindowId === windowId) {
     try {
-      await chrome.windows.get(backgroundWindowId);
-      return backgroundWindowId;
+      await chrome.tabGroups.get(tabGroupId);
+      return tabGroupId;
     } catch {
-      backgroundWindowId = null;
+      // Group no longer exists, fall through
+      tabGroupId = null;
+      groupWindowId = null;
     }
   }
-  const win = await chrome.windows.create({
-    focused: false,
-    type: "normal",
-    url: "about:blank",
-  });
-  backgroundWindowId = win.id;
-  return backgroundWindowId;
-}
 
-async function getOrCreateTabGroup(windowId) {
-  // Groups are ephemeral — always create fresh to avoid stale IDs across reloads
-  // Must keep at least one tab in the group (empty groups are auto-deleted)
+  // Create a new group in this window with an anchor tab
   const tab = await chrome.tabs.create({ windowId, url: "about:blank", active: false });
   const gid = await chrome.tabs.group({ tabIds: [tab.id], createProperties: { windowId } });
   await chrome.tabGroups.update(gid, { collapsed: true, title: "agent-browser" });
-  // NOTE: do NOT remove the anchor tab — empty groups are auto-deleted
+  // Keep anchor tab — empty groups are auto-deleted
   tabGroupId = gid;
+  groupWindowId = windowId;
   return gid;
 }
 
@@ -148,19 +120,18 @@ function cdpGetTargets() {
 // ═══════════════════════════════════════════════════════════════
 
 async function h_createTab() {
-  const windowId = await getOrCreateWindow();
-  const groupId = await getOrCreateTabGroup(windowId);
+  // Use user's current active window — like Codex
+  const win = await chrome.windows.getLastFocused({ populate: false });
+  const groupId = await getOrCreateTabGroup(win.id);
 
   const tab = await chrome.tabs.create({
-    windowId,
+    windowId: win.id,
     url: "about:blank",
     active: false,
   });
 
   await chrome.tabs.group({ tabIds: [tab.id], groupId });
-  await persistSession();
-
-  return { tabId: tab.id, windowId, url: "about:blank" };
+  return { tabId: tab.id, windowId: win.id, url: "about:blank" };
 }
 
 async function h_closeTab(params) {
@@ -301,15 +272,15 @@ async function h_getUserTabs() {
 
 async function h_activateTab(params) {
   const { tabId } = params;
+  // Only make tab active within its own window — don't steal focus
   await chrome.tabs.update(tabId, { active: true });
-  const tab = await chrome.tabs.get(tabId);
-  await chrome.windows.update(tab.windowId, { focused: true });
   return { tabId };
 }
 
+
 async function h_getSession() {
   return {
-    windowId: backgroundWindowId,
+    groupWindowId,
     tabGroupId,
     attachedTabs: Array.from(attachedTabs),
   };
@@ -319,16 +290,16 @@ async function h_finalizeTabs(params) {
   const { keep } = params;
   const keepSet = new Set(keep || []);
 
-  // Detach + close tabs not in keep list
+  // Detach tabs not in keep list
   for (const tabId of attachedTabs) {
     if (!keepSet.has(tabId)) {
       await h_detach({ tabId });
     }
   }
 
-  // Close agent tabs not in keep list (query by window)
-  if (backgroundWindowId) {
-    const tabs = await chrome.tabs.query({ windowId: backgroundWindowId });
+  // Close agent tabs not in keep list (query by group)
+  if (tabGroupId != null) {
+    const tabs = await chrome.tabs.query({ groupId: tabGroupId });
     for (const tab of tabs) {
       if (!keepSet.has(tab.id)) {
         try { await chrome.tabs.remove(tab.id); } catch { /* ok */ }
@@ -444,4 +415,4 @@ function connect() {
 // Startup
 // ═══════════════════════════════════════════════════════════════
 
-restoreSession().then(connect);
+connect();
