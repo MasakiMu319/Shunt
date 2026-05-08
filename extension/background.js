@@ -512,6 +512,17 @@ function connect() {
 }
 
 // ═══════════════════════════════════════════════════════════════
+// Popup (chrome.runtime.onMessage)
+// ═══════════════════════════════════════════════════════════════
+
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  handleRequest(msg).then(sendResponse).catch((err) => {
+    sendResponse({ jsonrpc: "2.0", id: msg.id, error: { code: -1, message: err.message } });
+  });
+  return true; // async
+});
+
+// ═══════════════════════════════════════════════════════════════
 // Startup
 // ═══════════════════════════════════════════════════════════════
 
