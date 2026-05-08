@@ -180,6 +180,77 @@ def cmd_get_text(rpc, args):
     print(result.get("text", ""))
 
 
+
+def cmd_snapshot(rpc, args):
+    """Get AX tree via CDP, output compact format with [ref=eN]"""
+    result = rpc.call("executeCdp", {
+        "tabId": args.tab_id,
+        "method": "Accessibility.getFullAXTree",
+        "params": {"depth": args.depth},
+    })
+    nodes = result.get("result", {}).get("nodes", [])
+    if not nodes:
+        print("(empty)")
+        return
+
+    node_map = {}
+    roots = []
+    for n in nodes:
+        node_map[n["nodeId"]] = n
+        if not n.get("parentId"):
+            roots.append(n)
+
+    def walk(node, depth):
+        if node.get("ignored"):
+            return
+        indent = "  " * min(depth, 8)
+        role = node.get("role", {}).get("value", "?")
+        name = node.get("name", {}).get("value", "")
+        ref = ""
+        if node.get("backendDOMNodeId"):
+            ref = f" [ref=e{node['backendDOMNodeId']}]"
+        name_str = f" \"{name[:80]}\"" if name else ""
+        print(f"{indent}{role}{name_str}{ref}")
+        for cid in node.get("childIds", []):
+            child = node_map.get(cid)
+            if child:
+                walk(child, depth + 1)
+
+    for root in roots:
+        walk(root, 0)
+
+def cmd_click_ref(rpc, args):
+    """Click element by backend node ID (from snapshot [ref=eN])"""
+    # Step 1: resolve backend node
+    resolve = rpc.call("executeCdp", {
+        "tabId": args.tab_id,
+        "method": "DOM.resolveNode",
+        "params": {"backendNodeId": args.node_id},
+    })
+    object_id = resolve.get("result", {}).get("object", {}).get("objectId")
+    if not object_id:
+        print("Error: could not resolve node", file=sys.stderr)
+        sys.exit(1)
+
+    # Step 2: get box model
+    box = rpc.call("executeCdp", {
+        "tabId": args.tab_id,
+        "method": "DOM.getBoxModel",
+        "params": {"objectId": object_id},
+    })
+    quad = box.get("result", {}).get("model", {}).get("content")
+    if not quad or len(quad) < 8:
+        print("Error: no box model for node", file=sys.stderr)
+        sys.exit(1)
+
+    # Step 3: center point
+    x = round((quad[0] + quad[4]) / 2)
+    y = round((quad[1] + quad[5]) / 2)
+
+    # Step 4: click
+    result = rpc.call("click", {"tabId": args.tab_id, "x": x, "y": y})
+    print(json.dumps(result))
+
 def cmd_finalize(rpc, args):
     keep = args.tab_ids if args.tab_ids else []
     result = rpc.call("finalizeTabs", {"keep": keep})
@@ -269,7 +340,18 @@ def main():
     p.add_argument("--max-length", type=int, default=10000)
     p.set_defaults(func=cmd_get_text)
 
+    p = sub.add_parser("snapshot", help="Get accessibility tree snapshot with [ref=eN]")
+    p.add_argument("tab_id", type=int)
+    p.add_argument("-d", "--depth", type=int, default=4, help="Max tree depth (default 4)")
+    p.set_defaults(func=cmd_snapshot)
+
+    p = sub.add_parser("click-ref", help="Click element by backend node ID (from snapshot ref)")
+    p.add_argument("tab_id", type=int)
+    p.add_argument("node_id", type=int, help="Backend DOM node ID (e.g. e123)")
+    p.set_defaults(func=cmd_click_ref)
+
     p = sub.add_parser("finalize", help="Close all agent tabs except the ones specified")
+
 
     p.add_argument("tab_ids", nargs="*", type=int, help="Tab IDs to keep")
     p.set_defaults(func=cmd_finalize)

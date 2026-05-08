@@ -171,6 +171,8 @@ async function h_attach(params) {
     await cdpSendCommand(tabId, "Page.enable");
     await cdpSendCommand(tabId, "Network.enable");
     await cdpSendCommand(tabId, "Runtime.enable");
+    await cdpSendCommand(tabId, "DOM.enable");
+    try { await cdpSendCommand(tabId, "Accessibility.enable"); } catch { /* optional */ }
     return { tabId, attached: true };
   });
 }
