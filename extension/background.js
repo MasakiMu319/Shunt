@@ -225,11 +225,16 @@ async function h_click(params) {
     if (!attachedTabs.has(tabId)) {
       throw new Error("Tab " + tabId + " not attached.");
     }
+    // Mouse move before click to position cursor
+    await cdpSendCommand(tabId, "Input.dispatchMouseEvent", {
+      type: "mouseMoved", x, y, modifiers: 0,
+    });
     const args = {
       type: "mousePressed",
       x, y,
       button: button || "left",
       clickCount: clickCount || 1,
+      modifiers: 0,
     };
     await cdpSendCommand(tabId, "Input.dispatchMouseEvent", args);
     args.type = "mouseReleased";
