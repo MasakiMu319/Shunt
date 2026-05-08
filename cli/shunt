@@ -126,6 +126,11 @@ def cmd_screenshot(rpc, args):
 
 def cmd_click(rpc, args):
     """Click at viewport coordinates via JS dispatch (CDP Input.dispatchMouseEvent broken in Helium)"""
+    double = getattr(args, 'double', False)
+    events = ['mousedown','mouseup','click','pointerdown','pointerup']
+    if double:
+        events += ['dblclick', 'mousedown','mouseup','click','pointerdown','pointerup']
+    events_str = ','.join(f"'{e}'" for e in events)
     result = rpc.call("executeCdp", {
         "tabId": args.tab_id,
         "method": "Runtime.evaluate",
@@ -134,10 +139,10 @@ def cmd_click(rpc, args):
             (() => {{
                 const el = document.elementFromPoint({args.x}, {args.y});
                 if (!el) return 'no-element at ({args.x},{args.y})';
-                ['mousedown','mouseup','click','pointerdown','pointerup'].forEach(t => {{
-                    el.dispatchEvent(new MouseEvent(t, {{ bubbles: true, cancelable: true, clientX: {args.x}, clientY: {args.y}, button: 0 }}));
+                [{events_str}].forEach(t => {{
+                    el.dispatchEvent(new MouseEvent(t, {{ bubbles: true, cancelable: true, clientX: {args.x}, clientY: {args.y}, button: 0, detail: t === 'dblclick' ? 2 : 1 }}));
                 }});
-                return 'clicked:' + el.tagName;
+                return {("'double-clicked:'" if double else "'clicked:'")} + el.tagName;
             }})()
             """,
             "returnByValue": True,
@@ -196,6 +201,66 @@ def cmd_type(rpc, args):
     })
     result["text"] = args.text
     print(json.dumps(result))
+
+# KeyCode mapping for common keys
+KEY_CODES = {
+    "Enter": 13, "Tab": 9, "Escape": 27, "Backspace": 8, "Delete": 46, "Space": 32,
+    "ArrowUp": 38, "ArrowDown": 40, "ArrowLeft": 37, "ArrowRight": 39,
+    "Home": 36, "End": 35, "PageUp": 33, "PageDown": 34,
+}
+
+def cmd_keypress(rpc, args):
+    """Dispatch key press via JS (CDP Input.dispatchKeyEvent broken in Helium)"""
+    key = args.key
+    key_code = KEY_CODES.get(key, 0)
+    result = rpc.call("executeCdp", {
+        "tabId": args.tab_id,
+        "method": "Runtime.evaluate",
+        "params": {
+            "expression": f"""
+            (() => {{
+                const el = document.activeElement || document.body;
+                const opts = {{ key: '{key}', code: '{key}', keyCode: {key_code},
+                    which: {key_code}, bubbles: true, cancelable: true, composed: true }};
+                ['keydown','keypress','keyup'].forEach(t => {{
+                    el.dispatchEvent(new KeyboardEvent(t, opts));
+                }});
+                return 'pressed:' + '{key}';
+            }})()
+            """,
+            "returnByValue": True,
+        },
+    })
+    result["key"] = key
+    print(json.dumps(result))
+
+
+def cmd_move(rpc, args):
+    """Move cursor to coordinates via JS mouse events (hover)"""
+    result = rpc.call("executeCdp", {
+        "tabId": args.tab_id,
+        "method": "Runtime.evaluate",
+        "params": {
+            "expression": f"""
+            (() => {{
+                const el = document.elementFromPoint({args.x}, {args.y});
+                if (!el) return 'no-element';
+                ['mouseover','mousemove','mouseenter'].forEach(t => {{
+                    el.dispatchEvent(new MouseEvent(t, {{
+                        bubbles: true, cancelable: true, clientX: {args.x}, clientY: {args.y},
+                        view: window
+                    }}));
+                }});
+                return 'moved:' + el.tagName;
+            }})()
+            """,
+            "returnByValue": True,
+        },
+    })
+    result["x"] = args.x
+    result["y"] = args.y
+    print(json.dumps(result))
+
 
 def cmd_scroll(rpc, args):
     """Scroll via JS (CDP Input.dispatchMouseEvent wheel broken in Helium)"""
@@ -403,7 +468,19 @@ def main():
     p.add_argument("tab_id", type=int)
     p.add_argument("x", type=int)
     p.add_argument("y", type=int)
+    p.add_argument("--double", action="store_true", help="Double click")
     p.set_defaults(func=cmd_click)
+
+    p = sub.add_parser("keypress", help="Press a keyboard key (Enter, Tab, Escape, ArrowUp, etc.)")
+    p.add_argument("tab_id", type=int)
+    p.add_argument("key", help="Key name: Enter, Tab, Escape, Backspace, Delete, Space, ArrowUp/Down/Left/Right, Home, End, PageUp, PageDown")
+    p.set_defaults(func=cmd_keypress)
+
+    p = sub.add_parser("move", help="Move cursor to coordinates (triggers hover states)")
+    p.add_argument("tab_id", type=int)
+    p.add_argument("x", type=int)
+    p.add_argument("y", type=int)
+    p.set_defaults(func=cmd_move)
 
     p = sub.add_parser("type", help="Type text via CDP Input.dispatchKeyEvent")
     p.add_argument("tab_id", type=int)
