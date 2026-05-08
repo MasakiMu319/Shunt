@@ -171,10 +171,6 @@ async function h_attach(params) {
     await cdpSendCommand(tabId, "Page.enable");
     await cdpSendCommand(tabId, "Network.enable");
     await cdpSendCommand(tabId, "Runtime.enable");
-    // Inject cursor overlay so agent can "see" its clicks
-    try {
-      await chrome.scripting.executeScript({ target: { tabId }, files: ["overlay.js"] });
-    } catch { /* may fail on chrome:// pages */ }
     return { tabId, attached: true };
   });
 }
@@ -227,11 +223,6 @@ async function h_click(params) {
     if (!attachedTabs.has(tabId)) {
       throw new Error("Tab " + tabId + " not attached.");
     }
-    // Show cursor overlay so agent can see where it clicked
-    try {
-      await chrome.tabs.sendMessage(tabId, { from: "shunt", action: "showCursor", x, y });
-    } catch { /* content script not ready, non-fatal */ }
-
     const args = {
       type: "mousePressed",
       x, y,
@@ -374,13 +365,6 @@ async function h_findElement(params) {
 
     const el = result.result?.value || null;
 
-    // Highlight if found
-    if (el) {
-      try {
-        await chrome.tabs.sendMessage(tabId, { from: "shunt", action: "highlight", rect: { x: el.x - el.width/2, y: el.y - el.height/2, width: el.width, height: el.height } });
-      } catch { /* ok */ }
-    }
-
     return { tabId, element: el };
   });
 }
@@ -400,13 +384,6 @@ async function h_getPageText(params) {
   });
 }
 
-async function h_clearHighlights(params) {
-  const { tabId } = params;
-  try {
-    await chrome.tabs.sendMessage(tabId, { from: "shunt", action: "clearHighlights" });
-  } catch { /* ok */ }
-  return { tabId };
-}
 
 
 // ═══════════════════════════════════════════════════════════════
@@ -429,7 +406,7 @@ const handlers = {
   finalizeTabs:  h_finalizeTabs,
   findElement:   h_findElement,
   getPageText:   h_getPageText,
-  clearHighlights: h_clearHighlights,
+  getPageText:   h_getPageText,
 };
 
 async function handleRequest(msg) {

@@ -179,9 +179,6 @@ def cmd_get_text(rpc, args):
     result = rpc.call("getPageText", params)
     print(result.get("text", ""))
 
-def cmd_clear_highlights(rpc, args):
-    result = rpc.call("clearHighlights", {"tabId": args.tab_id})
-    print(json.dumps(result))
 
 def cmd_finalize(rpc, args):
     keep = args.tab_ids if args.tab_ids else []
@@ -271,10 +268,6 @@ def main():
     p.add_argument("tab_id", type=int)
     p.add_argument("--max-length", type=int, default=10000)
     p.set_defaults(func=cmd_get_text)
-
-    p = sub.add_parser("clear-highlights", help="Remove all element highlight overlays")
-    p.add_argument("tab_id", type=int)
-    p.set_defaults(func=cmd_clear_highlights)
 
     p = sub.add_parser("finalize", help="Close all agent tabs except the ones specified")
 
