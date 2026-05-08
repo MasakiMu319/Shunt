@@ -171,8 +171,6 @@ async function h_attach(params) {
     await cdpSendCommand(tabId, "Page.enable");
     await cdpSendCommand(tabId, "Network.enable");
     await cdpSendCommand(tabId, "Runtime.enable");
-    await cdpSendCommand(tabId, "DOM.enable");
-    try { await cdpSendCommand(tabId, "Accessibility.enable"); } catch { /* optional */ }
     return { tabId, attached: true };
   });
 }
@@ -388,74 +386,6 @@ async function h_getPageText(params) {
 
 
 
-async function h_getAxtree(params) {
-  const { tabId, maxDepth, compact } = params || {};
-  return withTabLock(tabId, async () => {
-    if (!attachedTabs.has(tabId)) throw new Error("Tab " + tabId + " not attached.");
-    let nodes;
-    try {
-      const result = await cdpSendCommand(tabId, "Accessibility.getFullAXTree", {
-        depth: maxDepth || 4,
-      });
-      nodes = result.nodes || [];
-    } catch {
-      return { tabId, nodes: [], count: 0 };
-    }
-    if (compact) {
-      const lines = [];
-      const seen = new Set();
-      const walkFn = (node, depth) => {
-        if (!node || node.ignored) return;
-        const key = "" + (node.backendDOMNodeId || "") + "|" + (node.role?.value || "");
-        if (seen.has(key)) return;
-        seen.add(key);
-        const indent = "  ".repeat(Math.min(depth, 6));
-        const role = node.role?.value || "?";
-        const name = node.name?.value || "";
-        const ref = node.backendDOMNodeId ? " [ref=e" + node.backendDOMNodeId + "]" : "";
-        const nameStr = name ? " " + JSON.stringify(name.substring(0, 60)) : "";
-        lines.push(indent + role + nameStr + ref);
-        if (node.childIds) {
-          for (const cid of node.childIds) {
-            const child = nodes.find(n => n.nodeId === cid);
-            if (child) walkFn(child, depth + 1);
-          }
-        }
-      };
-      if (nodes.length > 0) walkFn(nodes[0], 0);
-      return { tabId, nodes: lines, count: lines.length };
-    }
-    const filtered = nodes.filter(n => !n.ignored);
-    return { tabId, nodes: filtered, count: filtered.length };
-  });
-}
-
-async function h_resolveNode(params) {
-  const { tabId, backendNodeId } = params;
-  return withTabLock(tabId, async () => {
-    if (!attachedTabs.has(tabId)) throw new Error("Tab " + tabId + " not attached.");
-    if (!backendNodeId) throw new Error("backendNodeId is required");
-    const resolveResult = await cdpSendCommand(tabId, "DOM.resolveNode", { backendNodeId });
-    const objectId = resolveResult?.object?.objectId;
-    if (!objectId) throw new Error("Failed to resolve backend node");
-    const boxResult = await cdpSendCommand(tabId, "DOM.getBoxModel", { objectId });
-    const c = boxResult?.model?.content;
-    if (!c || c.length < 8) throw new Error("No box model");
-    return {
-      tabId, backendNodeId,
-      center: { x: Math.round((c[0]+c[4])/2), y: Math.round((c[1]+c[5])/2) },
-      rect: { x: Math.round(c[0]), y: Math.round(c[1]), width: Math.round(c[4]-c[0]), height: Math.round(c[5]-c[1]) },
-    };
-  });
-}
-
-async function h_clickRef(params) {
-  const { tabId, backendNodeId } = params;
-  const r = await h_resolveNode({ tabId, backendNodeId });
-  return h_click({ tabId, x: r.center.x, y: r.center.y });
-}
-
-
 // ═══════════════════════════════════════════════════════════════
 // Handler router
 // ═══════════════════════════════════════════════════════════════
@@ -468,7 +398,6 @@ const handlers = {
   executeCdp:    h_executeCdp,
   screenshot:    h_screenshot,
   click:         h_click,
-  clickRef:      h_clickRef,
   type:          h_type,
   scroll:        h_scroll,
   getUserTabs:   h_getUserTabs,
@@ -477,8 +406,7 @@ const handlers = {
   finalizeTabs:  h_finalizeTabs,
   findElement:   h_findElement,
   getPageText:   h_getPageText,
-  getAxtree:     h_getAxtree,
-  resolveNode:   h_resolveNode,
+  getPageText:   h_getPageText,
 };
 
 async function handleRequest(msg) {
