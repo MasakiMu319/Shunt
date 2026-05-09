@@ -14,7 +14,6 @@ const FETCH_TIMEOUT_MS = 15_000;
 const DEFUDDLE_MIN_CHARS = 200;
 const CDP_POLL_INTERVAL = 500;
 const CDP_POLL_MAX = 30;
-const MAX_OUTPUT_CHARS = 64_000;
 const MIN_CDP_HTML = 500;
 const HEARTBEAT_INTERVAL = 30_000;
 
@@ -52,25 +51,10 @@ const CDP_WAIT_EXPR = [
   "document.body?.innerText || '').trim().length > 200)",
 ].join(" ");
 
-// Layer 1: specific selectors → Layer 2: <p> grandparent → Layer 3: body text
-const CDP_EXTRACT_EXPR = [
-  "(function(){",
-  "const sel=['.newstext','.article-content','.article-body','[itemprop=\"articleBody\"]',",
-  " '.post-content','.entry-content','.story-body','.post-body',",
-  " '#ContentBody','#article_content','.content-article','.news-content',",
-  " '.article-text','.body-content','.main-content','.detail-content'];",
-  "for(const s of sel){const c=document.querySelector(s);",
-  " if(c&&c.innerText.length>200&&c.outerHTML.length>500)return c.outerHTML;}",
-  "const ps=document.querySelectorAll('p');",
-  "for(const p of ps){if(p.innerText.length>80){",
-  " let el=p.parentElement;",
-  " for(let d=0;d<5&&el;d++){",
-  "  const t=el.innerText.length;",
-  "  if(t>200&&t<50000&&el.outerHTML.length>500)return el.outerHTML;",
-  "  el=el.parentElement;}}}",
-  "return JSON.stringify({_plaintext:true,text:document.body.innerText||''});",
-  "})()",
-].join("");
+const CDP_EXTRACT_EXPR = "document.documentElement.outerHTML";
+
+// Plain text mode: bypass defuddle, get body.innerText directly
+const CDP_TEXT_EXPR = "document.body.innerText";
 
 // ── JSON-RPC Client ───────────────────────────────────────────────────────
 
@@ -177,11 +161,6 @@ setInterval(sendHeartbeat, HEARTBEAT_INTERVAL);
 
 // ── Defuddle wrapper ──────────────────────────────────────────────────────
 
-function documentTitle(text: string): string {
-  const firstLine = text.split("\n")[0]?.trim();
-  return (firstLine && firstLine.length < 200) ? firstLine : "";
-}
-
 async function defuddleHtml(html: string, url: string): Promise<{ title: string; text: string }> {
   try {
     const { Defuddle } = await import("defuddle/node");
@@ -226,7 +205,11 @@ function isBlockPage(html: string, text: string): boolean {
   return false;
 }
 
-async function readPage(url: string): Promise<{
+type ReadMode = "raw" | "defuddle" | "text";
+
+async function readPage(url: string, opts?: {
+  mode?: ReadMode;
+}): Promise<{
   source: string; title: string; charCount: number; elapsed: number; content: string;
 }> {
   const start = Date.now();
@@ -249,6 +232,29 @@ async function readPage(url: string): Promise<{
         throw new Error(`unexpected content-type: ${ct}`);
       }
       html = await res.text();
+
+      // Mode: raw — return HTML as-is
+      if (opts?.mode === "raw") {
+        return {
+          source: "http", title: "", charCount: html.length,
+          elapsed: Date.now() - start,
+          content: html,
+        };
+      }
+
+      // Mode: text — strip HTML tags, return plain text
+      if (opts?.mode === "text") {
+        const text = html.replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "")
+          .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, "")
+          .replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+        return {
+          source: "http", title: "", charCount: text.length,
+          elapsed: Date.now() - start,
+          content: text,
+        };
+      }
+
+      // Mode: defuddle (default)
       const { title, text } = await defuddleHtml(html, url);
 
       // Block-page detection
@@ -257,9 +263,7 @@ async function readPage(url: string): Promise<{
           source: "http", title,
           charCount: text.length,
           elapsed: Date.now() - start,
-          content: text.length > MAX_OUTPUT_CHARS
-            ? text.slice(0, MAX_OUTPUT_CHARS) + "\n\n[... content truncated]"
-            : text,
+          content: text,
         };
       }
     } catch { /* fall through to CDP */ }
@@ -287,29 +291,39 @@ async function readPage(url: string): Promise<{
       } catch { /* keep polling */ }
     }
 
-    // Try main content container first, fallback to full document
-    const htmlResult = (await rpc.call("executeCdp", {
-      tabId, method: "Runtime.evaluate",
-      params: { expression: CDP_EXTRACT_EXPR, returnByValue: true },
-    })) as { result?: { result?: { value?: unknown } } };
-
-    const rawVal = htmlResult.result?.result?.value;
-    if (typeof rawVal === "string" && rawVal.startsWith('{"_plaintext":')) {
-      const { text: pt } = JSON.parse(rawVal);
-      if (!pt || pt.length < DEFUDDLE_MIN_CHARS) throw new Error("plaintext fallback returned insufficient content");
+    // Mode: text — get body.innerText directly, bypass defuddle
+    if (opts?.mode === "text") {
+      const textResult = (await rpc.call("executeCdp", {
+        tabId, method: "Runtime.evaluate",
+        params: { expression: CDP_TEXT_EXPR, returnByValue: true },
+      })) as { result?: { result?: { value?: string } } };
+      const text = textResult.result?.result?.value ?? "";
+      if (!text || text.length < 50) throw new Error("CDP text mode returned insufficient content");
       return {
-        source: "cdp", title: documentTitle(pt),
-        charCount: pt.length,
+        source: "cdp", title: "", charCount: text.length,
         elapsed: Date.now() - start,
-        content: pt.length > MAX_OUTPUT_CHARS
-          ? pt.slice(0, MAX_OUTPUT_CHARS) + "\n\n[... content truncated]"
-          : pt,
+        content: text,
       };
     }
 
-    html = (rawVal as string) ?? "";
+    const htmlResult = (await rpc.call("executeCdp", {
+      tabId, method: "Runtime.evaluate",
+      params: { expression: CDP_EXTRACT_EXPR, returnByValue: true },
+    })) as { result?: { result?: { value?: string } } };
+
+    html = htmlResult.result?.result?.value ?? "";
     if (!html || html.length < MIN_CDP_HTML) throw new Error("CDP returned insufficient HTML");
 
+    // Mode: raw — return HTML as-is
+    if (opts?.mode === "raw") {
+      return {
+        source: "cdp", title: "", charCount: html.length,
+        elapsed: Date.now() - start,
+        content: html,
+      };
+    }
+
+    // Mode: defuddle (default)
     const { title, text } = await defuddleHtml(html, url);
     if (text.length < DEFUDDLE_MIN_CHARS) {
       throw new Error(
@@ -321,9 +335,7 @@ async function readPage(url: string): Promise<{
       source: "cdp", title,
       charCount: text.length,
       elapsed: Date.now() - start,
-      content: text.length > MAX_OUTPUT_CHARS
-        ? text.slice(0, MAX_OUTPUT_CHARS) + "\n\n[... content truncated]"
-        : text,
+      content: text,
     };
   } finally {
     try { await rpc.call("detach", { tabId }); } catch { /* ok */ }
@@ -641,9 +653,9 @@ async function cmd_ping(rpc: ShuntRPC) {
   }
 }
 
-async function cmd_readPage(url: string) {
+async function cmd_readPage(url: string, mode: ReadMode) {
   try {
-    const result = await readPage(url);
+    const result = await readPage(url, { mode });
     console.log(JSON.stringify(result));
   } catch (e) {
     console.error(`Error: ${e instanceof Error ? e.message : String(e)}`);
@@ -683,7 +695,7 @@ Commands:
   finalize   [tabIds...]                                  Close tabs except listed
   wait-for   <tabId> <event> [--timeout N]                Wait for CDP event
   ping                          Verify connectivity
-  read-page <url>               Read page (HTTP first, CDP fallback)
+  read-page <url> [--raw|--text]  Read page (HTTP first, CDP fallback). --raw=HTML, --text=plain, default=defuddle
 `;
 
 function printUsage() {
@@ -698,9 +710,16 @@ async function main() {
 
   // read-page uses its own RPC (for CDP fallback)
   if (cmd === "read-page") {
-    const url = args[1];
+    const args2 = args.slice(1);
+    let mode: ReadMode = "defuddle";
+    let url = "";
+    for (const a of args2) {
+      if (a === "--raw") { mode = "raw"; }
+      else if (a === "--text") { mode = "text"; }
+      else if (a.startsWith("http")) { url = a; }
+    }
     if (!url) { console.error("Error: url required"); process.exit(1); }
-    await cmd_readPage(url);
+    await cmd_readPage(url, mode);
     return;
   }
 
