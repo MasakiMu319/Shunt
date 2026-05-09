@@ -428,12 +428,24 @@ const handlers = {
   finalizeTabs:  h_finalizeTabs,
   findElement:   h_findElement,
   getPageText:   h_getPageText,
+  ping:          h_ping,
 };
+
+// Notification handlers (one-way, no id)
+function handleNotification(msg) {
+  const { method, params } = msg;
+  switch (method) {
+    case "heartbeat":
+      lastHeartbeat = Date.now();
+      break;
+    // Add more notification handlers here
+  }
+}
 
 async function handleRequest(msg) {
   const { id, method, params } = msg;
   if (id == null) {
-    // Notification — route to event listeners
+    handleNotification(msg);
     return;
   }
   const handler = handlers[method];
@@ -479,6 +491,67 @@ chrome.debugger.onDetach.addListener((source, reason) => {
 });
 
 // ═══════════════════════════════════════════════════════════════
+// Heartbeat — CLI sends periodic heartbeats; extension monitors timeout
+// ═══════════════════════════════════════════════════════════════
+
+const HEARTBEAT_NAME = "shunt-heartbeat";
+const HEARTBEAT_CHECK_PERIOD = 10;  // seconds — check every 10s
+const HEARTBEAT_GRACE     = 45;  // seconds — grace period before cleanup on first connect
+const HEARTBEAT_TIMEOUT   = 35;  // seconds — cleanup if no heartbeat this long
+
+let lastHeartbeat = Date.now();
+let heartbeatArmed = false;
+
+function startHeartbeat() {
+  lastHeartbeat = Date.now();
+  heartbeatArmed = true;
+  chrome.alarms.create(HEARTBEAT_NAME, { periodInMinutes: HEARTBEAT_CHECK_PERIOD / 60 });
+}
+
+function stopHeartbeat() {
+  heartbeatArmed = false;
+  chrome.alarms.clear(HEARTBEAT_NAME);
+}
+
+async function cleanup(reason) {
+  console.warn("shunt: cleanup —", reason);
+  for (const tabId of attachedTabs) {
+    try { await chrome.debugger.detach({ tabId }); } catch { /* ok */ }
+  }
+  attachedTabs.clear();
+  tabLocks.clear();
+}
+
+// Connectivity check (simple round-trip, no side effects)
+function h_ping() {
+  return { ok: true };
+}
+
+// Heartbeat received from CLI via notification
+
+chrome.alarms.onAlarm.addListener(async (alarm) => {
+  if (alarm.name !== HEARTBEAT_NAME || !heartbeatArmed) return;
+
+  const elapsed = (Date.now() - lastHeartbeat) / 1000;
+
+  // Grace period on first connect: CLI may still be starting up
+  if (elapsed < HEARTBEAT_GRACE) return;
+
+  if (elapsed > HEARTBEAT_TIMEOUT) {
+    stopHeartbeat();
+    await cleanup("heartbeat timeout");
+    sendNotification("statusReport", {
+      report: {
+        nativeHost: "unreachable",
+        connected: false,
+        attachedTabs: [],
+        attachedCount: 0,
+      },
+    });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
 // Native Messaging connection
 // ═══════════════════════════════════════════════════════════════
 
@@ -493,17 +566,14 @@ function connect() {
     });
 
     port.onDisconnect.addListener(async () => {
-      console.warn("shunt: native host disconnected");
-      // Detach all debuggers
-      for (const tabId of attachedTabs) {
-        try { await chrome.debugger.detach({ tabId }); } catch { /* ok */ }
-      }
-      attachedTabs.clear();
-      tabLocks.clear();
+      console.warn("shunt: host diconnected, triggering cleanup");
+      stopHeartbeat();
+      await cleanup("native host disconnected");
       port = null;
       setTimeout(connect, 1000);
     });
 
+    startHeartbeat();
     console.log("shunt: connected");
   } catch (err) {
     console.error("shunt: connect failed", err);

@@ -4,6 +4,7 @@
   "manifest_version": 3,
   "description": "Browser automation transport for Helium — three layers, zero coupling.",
   "permissions": [
+    "alarms",
     "debugger",
     "tabs",
     "tabGroups",

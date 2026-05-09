@@ -1,0 +1,8 @@
+{
+  "name": "shunt",
+  "version": "2.0.0",
+  "type": "module",
+  "dependencies": {
+    "defuddle": "latest"
+  }
+}

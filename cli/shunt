@@ -10,6 +10,8 @@ import sys
 import os
 import argparse
 import select
+import threading
+import time
 
 SOCKET_PATH = "/tmp/shunt.sock"
 
@@ -89,6 +91,27 @@ class ShuntRPC:
                         return params.get("params", {})
         except socket.timeout:
             raise TimeoutError(f"Timeout waiting for {event_method} on tab {tab_id}")
+
+
+# ── Heartbeat (daemon thread) ──
+
+HEARTBEAT_INTERVAL = 30  # seconds
+
+def _heartbeat_loop():
+    """Send heartbeat notification to extension every HEARTBEAT_INTERVAL seconds."""
+    while True:
+        time.sleep(HEARTBEAT_INTERVAL)
+        try:
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.settimeout(3)
+            s.connect(SOCKET_PATH)
+            s.sendall(json.dumps({"jsonrpc": "2.0", "method": "heartbeat"}).encode() + b"\n")
+            s.close()
+        except Exception:
+            pass  # silent — extension will timeout and clean up
+
+_heartbeat_thread = threading.Thread(target=_heartbeat_loop, daemon=True)
+_heartbeat_thread.start()
 
 
 # ── CLI Commands ──
@@ -575,6 +598,20 @@ def cmd_wait_for(rpc, args):
         sys.exit(1)
 
 
+def cmd_ping(rpc, args):
+    """Verify full chain connectivity: CLI → host → extension → response."""
+    try:
+        result = rpc.call("ping")
+        if result.get("ok"):
+            print("shunt ok")
+        else:
+            print("shunt unexpected response", file=sys.stderr)
+            sys.exit(1)
+    except Exception as e:
+        print(f"shunt unreachable: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
 # ── Main ──
 
 def main():
@@ -703,6 +740,9 @@ def main():
     p.add_argument("event", help="CDP event method (e.g. Page.loadEventFired)")
     p.add_argument("--timeout", type=int, default=30)
     p.set_defaults(func=cmd_wait_for)
+
+    p = sub.add_parser("ping", help="Verify Shunt connectivity (extension → host → CLI round-trip)")
+    p.set_defaults(func=cmd_ping)
 
     args = parser.parse_args()
     # Pre-process drag path: "100,200 300,400" → [(100,200),(300,400)]
