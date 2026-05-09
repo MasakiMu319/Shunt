@@ -18,6 +18,30 @@ const MAX_OUTPUT_CHARS = 64_000;
 const MIN_CDP_HTML = 500;
 const HEARTBEAT_INTERVAL = 30_000;
 
+// Domains where HTTP fetch returns empty/SPA shells → skip to CDP
+const CDP_FIRST_DOMAINS = new Set([
+  "x.com", "twitter.com",
+  "youtube.com", "youtu.be",
+  "instagram.com",
+  "facebook.com", "fb.com",
+  "reddit.com",
+  "linkedin.com",
+  "tiktok.com",
+  "discord.com",
+  "notion.so",
+  "medium.com",
+  "web.telegram.org", "web.telegram.org",
+  "cnbc.com",       // anti-scraping: returns "DO NOT DELETE"
+  "bloomberg.com",
+  "wsj.com",
+  "ft.com",
+]);
+
+// Anti-scraping signals in HTTP response (detect block pages)
+const BLOCK_SIGNALS_TITLE = /just a moment|access denied|do not delete|blocked|captcha|are you a robot|403 forbidden|attention required/i;
+const BLOCK_SIGNALS_BODY = /cf-browser-verification|challenge-platform|g-recaptcha|access denied/i;
+const BLOCK_RATIO_THRESHOLD = 0.03; // text chars / html bytes below this → likely JS shell
+
 const USER_AGENT =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) " +
   "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
@@ -25,8 +49,28 @@ const USER_AGENT =
 const CDP_WAIT_EXPR = [
   "document.readyState === 'complete' &&",
   "((document.querySelector(\"article, main, [role='main']\")?.innerText ||",
-  "document.body.innerText || '').trim().length > 200)",
+  "document.body?.innerText || '').trim().length > 200)",
 ].join(" ");
+
+// Layer 1: specific selectors → Layer 2: <p> grandparent → Layer 3: body text
+const CDP_EXTRACT_EXPR = [
+  "(function(){",
+  "const sel=['.newstext','.article-content','.article-body','[itemprop=\"articleBody\"]',",
+  " '.post-content','.entry-content','.story-body','.post-body',",
+  " '#ContentBody','#article_content','.content-article','.news-content',",
+  " '.article-text','.body-content','.main-content','.detail-content'];",
+  "for(const s of sel){const c=document.querySelector(s);",
+  " if(c&&c.innerText.length>200&&c.outerHTML.length>500)return c.outerHTML;}",
+  "const ps=document.querySelectorAll('p');",
+  "for(const p of ps){if(p.innerText.length>80){",
+  " let el=p.parentElement;",
+  " for(let d=0;d<5&&el;d++){",
+  "  const t=el.innerText.length;",
+  "  if(t>200&&t<50000&&el.outerHTML.length>500)return el.outerHTML;",
+  "  el=el.parentElement;}}}",
+  "return JSON.stringify({_plaintext:true,text:document.body.innerText||''});",
+  "})()",
+].join("");
 
 // ── JSON-RPC Client ───────────────────────────────────────────────────────
 
@@ -133,6 +177,11 @@ setInterval(sendHeartbeat, HEARTBEAT_INTERVAL);
 
 // ── Defuddle wrapper ──────────────────────────────────────────────────────
 
+function documentTitle(text: string): string {
+  const firstLine = text.split("\n")[0]?.trim();
+  return (firstLine && firstLine.length < 200) ? firstLine : "";
+}
+
 async function defuddleHtml(html: string, url: string): Promise<{ title: string; text: string }> {
   try {
     const { Defuddle } = await import("defuddle/node");
@@ -157,39 +206,66 @@ async function defuddleHtml(html: string, url: string): Promise<{ title: string;
 
 // ── read-page command ─────────────────────────────────────────────────────
 
+function isCdpFirst(urlStr: string): boolean {
+  try {
+    const host = new URL(urlStr).hostname.replace(/^www\./, "");
+    for (const d of CDP_FIRST_DOMAINS) {
+      if (host === d || host.endsWith("." + d)) return true;
+    }
+  } catch { /* malformed URL */ }
+  return false;
+}
+
+function isBlockPage(html: string, text: string): boolean {
+  const titleMatch = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+  const title = titleMatch?.[1]?.trim() || "";
+  if (BLOCK_SIGNALS_TITLE.test(title)) return true;
+  if (BLOCK_SIGNALS_BODY.test(html)) return true;
+  // text-to-html ratio: if extracted text is tiny relative to html size
+  if (html.length > 5000 && text.length / html.length < BLOCK_RATIO_THRESHOLD) return true;
+  return false;
+}
+
 async function readPage(url: string): Promise<{
   source: string; title: string; charCount: number; elapsed: number; content: string;
 }> {
   const start = Date.now();
+  let html = "";
 
-  try {
-    const res = await fetch(url, {
-      headers: {
-        "User-Agent": USER_AGENT,
-        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7",
-      },
-      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-    });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const ct = res.headers.get("content-type") ?? "";
-    if (!ct.includes("html") && !ct.includes("xml")) {
-      throw new Error(`unexpected content-type: ${ct}`);
-    }
-    const html = await res.text();
-    const { title, text } = await defuddleHtml(html, url);
-    if (text.length >= DEFUDDLE_MIN_CHARS) {
-      return {
-        source: "http", title,
-        charCount: text.length,
-        elapsed: Date.now() - start,
-        content: text.length > MAX_OUTPUT_CHARS
-          ? text.slice(0, MAX_OUTPUT_CHARS) + "\n\n[... content truncated]"
-          : text,
-      };
-    }
-  } catch { /* fall through to CDP */ }
+  // ── Phase 1: HTTP (skip for known JS-heavy domains) ─────────────────
+  if (!isCdpFirst(url)) {
+    try {
+      const res = await fetch(url, {
+        headers: {
+          "User-Agent": USER_AGENT,
+          Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+          "Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7",
+        },
+        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const ct = res.headers.get("content-type") ?? "";
+      if (!ct.includes("html") && !ct.includes("xml")) {
+        throw new Error(`unexpected content-type: ${ct}`);
+      }
+      html = await res.text();
+      const { title, text } = await defuddleHtml(html, url);
 
+      // Block-page detection
+      if (!isBlockPage(html, text) && text.length >= DEFUDDLE_MIN_CHARS) {
+        return {
+          source: "http", title,
+          charCount: text.length,
+          elapsed: Date.now() - start,
+          content: text.length > MAX_OUTPUT_CHARS
+            ? text.slice(0, MAX_OUTPUT_CHARS) + "\n\n[... content truncated]"
+            : text,
+        };
+      }
+    } catch { /* fall through to CDP */ }
+  }
+
+  // ── Phase 2: CDP fallback ───────────────────────────────────────────
   const rpc = new ShuntRPC();
   let tabId = 0;
   try {
@@ -199,6 +275,7 @@ async function readPage(url: string): Promise<{
     await rpc.call("executeCdp", { tabId, method: "Page.navigate", params: { url } });
 
     const waitExpr = `(() => (${CDP_WAIT_EXPR}))()`;
+    let contentReady = false;
     for (let i = 0; i < CDP_POLL_MAX; i++) {
       await Bun.sleep(CDP_POLL_INTERVAL);
       try {
@@ -206,19 +283,40 @@ async function readPage(url: string): Promise<{
           tabId, method: "Runtime.evaluate",
           params: { expression: waitExpr, returnByValue: true },
         })) as { result?: { result?: { value?: unknown } } };
-        if (poll.result?.result?.value === true) break;
+        if (poll.result?.result?.value === true) { contentReady = true; break; }
       } catch { /* keep polling */ }
     }
 
+    // Try main content container first, fallback to full document
     const htmlResult = (await rpc.call("executeCdp", {
       tabId, method: "Runtime.evaluate",
-      params: { expression: "document.documentElement.outerHTML", returnByValue: true },
-    })) as { result?: { result?: { value?: string } } };
+      params: { expression: CDP_EXTRACT_EXPR, returnByValue: true },
+    })) as { result?: { result?: { value?: unknown } } };
 
-    const html = htmlResult.result?.result?.value;
+    const rawVal = htmlResult.result?.result?.value;
+    if (typeof rawVal === "string" && rawVal.startsWith('{"_plaintext":')) {
+      const { text: pt } = JSON.parse(rawVal);
+      if (!pt || pt.length < DEFUDDLE_MIN_CHARS) throw new Error("plaintext fallback returned insufficient content");
+      return {
+        source: "cdp", title: documentTitle(pt),
+        charCount: pt.length,
+        elapsed: Date.now() - start,
+        content: pt.length > MAX_OUTPUT_CHARS
+          ? pt.slice(0, MAX_OUTPUT_CHARS) + "\n\n[... content truncated]"
+          : pt,
+      };
+    }
+
+    html = (rawVal as string) ?? "";
     if (!html || html.length < MIN_CDP_HTML) throw new Error("CDP returned insufficient HTML");
 
     const { title, text } = await defuddleHtml(html, url);
+    if (text.length < DEFUDDLE_MIN_CHARS) {
+      throw new Error(
+        `defuddle produced ${text.length} chars from ${html.length} bytes HTML` +
+        (contentReady ? "" : "; page may not have finished rendering"),
+      );
+    }
     return {
       source: "cdp", title,
       charCount: text.length,
