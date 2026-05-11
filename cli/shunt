@@ -131,6 +131,10 @@ def cmd_create_tab(rpc, args):
     result = rpc.call("createTab")
     print(json.dumps(result))
 
+def cmd_close_window(rpc, args):
+    result = rpc.call("closeWindow", {"windowId": args.window_id})
+    print(json.dumps(result))
+
 def cmd_close_tab(rpc, args):
     result = rpc.call("closeTab", {"tabId": args.tab_id})
     print(json.dumps(result))
@@ -637,6 +641,10 @@ def main():
 
     p = sub.add_parser("create-tab", help="Create a new background tab")
     p.set_defaults(func=cmd_create_tab)
+
+    p = sub.add_parser("close-window", help="Close a browser window")
+    p.add_argument("window_id", type=int)
+    p.set_defaults(func=cmd_close_window)
 
     p = sub.add_parser("close-tab", help="Close a tab (detaches debugger if attached)")
     p.add_argument("tab_id", type=int)

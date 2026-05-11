@@ -161,6 +161,26 @@ async function h_createWindow(params) {
   return { windowId: win.id, focused: win.focused };
 }
 
+async function h_closeWindow(params) {
+  const { windowId } = params;
+  // If the Shunt group is in this window, move it to another window first
+  if (tabGroupId != null && groupWindowId === windowId) {
+    const wins = await chrome.windows.getAll({ populate: false });
+    const other = wins.find(w => w.id !== windowId);
+    if (other) {
+      await chrome.tabGroups.move(tabGroupId, { windowId: other.id, index: -1 });
+      groupWindowId = other.id;
+    } else {
+      // Last window — just let the group die with the window
+      tabGroupId = null;
+      groupWindowId = null;
+      anchorTabId = null;
+    }
+  }
+  try { await chrome.windows.remove(windowId); } catch { /* ok */ }
+  return { windowId };
+}
+
 async function h_createTab() {
   // Use user's current active window — like Codex
   const win = await chrome.windows.getLastFocused({ populate: false });
@@ -453,6 +473,7 @@ async function h_getPageText(params) {
 
 const handlers = {
   createWindow:  h_createWindow,
+  closeWindow:   h_closeWindow,
   createTab:     h_createTab,
   closeTab:      h_closeTab,
   attach:        h_attach,

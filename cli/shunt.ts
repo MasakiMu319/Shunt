@@ -350,6 +350,10 @@ async function cmd_createTab(rpc: ShuntRPC) {
   console.log(JSON.stringify(await rpc.call("createTab")));
 }
 
+async function cmd_closeWindow(rpc: ShuntRPC, windowId: number) {
+  console.log(JSON.stringify(await rpc.call("closeWindow", { windowId })));
+}
+
 async function cmd_closeTab(rpc: ShuntRPC, tabId: number) {
   console.log(JSON.stringify(await rpc.call("closeTab", { tabId })));
 }
@@ -672,6 +676,7 @@ Usage: shunt <command> [args]
 Commands:
   create-window [--url URL] [--incognito] [--focused]
                             Create new window
+  close-window <windowId>   Close a window
   create-tab                Create new background tab
   close-tab  <tabId>        Close a tab
   attach     <tabId>        Attach debugger
@@ -740,6 +745,12 @@ async function main() {
 
       case "create-tab":
         await cmd_createTab(rpc); break;
+
+      case "close-window": {
+        const wid = Number(args[1]);
+        if (!wid) { console.error("Error: window_id required"); process.exit(1); }
+        await cmd_closeWindow(rpc, wid); break;
+      }
 
       case "close-tab": {
         const tid = Number(args[1]);
