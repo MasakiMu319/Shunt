@@ -151,6 +151,16 @@ function cdpGetTargets() {
 // Request handlers
 // ═══════════════════════════════════════════════════════════════
 
+async function h_createWindow(params) {
+  const { url, incognito, focused } = params || {};
+  const win = await chrome.windows.create({
+    url: url || "about:blank",
+    incognito: incognito || false,
+    focused: focused !== false,
+  });
+  return { windowId: win.id, focused: win.focused };
+}
+
 async function h_createTab() {
   // Use user's current active window — like Codex
   const win = await chrome.windows.getLastFocused({ populate: false });
@@ -442,6 +452,7 @@ async function h_getPageText(params) {
 // ═══════════════════════════════════════════════════════════════
 
 const handlers = {
+  createWindow:  h_createWindow,
   createTab:     h_createTab,
   closeTab:      h_closeTab,
   attach:        h_attach,

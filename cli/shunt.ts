@@ -670,6 +670,8 @@ const USAGE = `Shunt CLI v2 — Browser automation via Helium Extension
 Usage: shunt <command> [args]
 
 Commands:
+  create-window [--url URL] [--incognito] [--focused]
+                            Create new window
   create-tab                Create new background tab
   close-tab  <tabId>        Close a tab
   attach     <tabId>        Attach debugger
@@ -726,6 +728,16 @@ async function main() {
   const rpc = new ShuntRPC();
   try {
     switch (cmd) {
+      case "create-window": {
+        const opts: Record<string, unknown> = {};
+        for (let i = 1; i < args.length; i++) {
+          if (args[i] === "--url" && args[i + 1]) opts.url = args[++i];
+          else if (args[i] === "--incognito") opts.incognito = true;
+          else if (args[i] === "--focused") opts.focused = args[++i] !== "false";
+        }
+        await cmd_createWindow(rpc, opts); break;
+      }
+
       case "create-tab":
         await cmd_createTab(rpc); break;
 

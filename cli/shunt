@@ -116,6 +116,17 @@ _heartbeat_thread.start()
 
 # ── CLI Commands ──
 
+def cmd_create_window(rpc, args):
+    params = {}
+    if args.url:
+        params["url"] = args.url
+    if args.incognito:
+        params["incognito"] = True
+    if args.focused is not None:
+        params["focused"] = args.focused
+    result = rpc.call("createWindow", params)
+    print(json.dumps(result))
+
 def cmd_create_tab(rpc, args):
     result = rpc.call("createTab")
     print(json.dumps(result))
@@ -617,6 +628,12 @@ def cmd_ping(rpc, args):
 def main():
     parser = argparse.ArgumentParser(prog="shunt", description="Browser automation via Helium Extension")
     sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("create-window", help="Create a new browser window")
+    p.add_argument("--url", help="URL to open in the new window (default: about:blank)")
+    p.add_argument("--incognito", action="store_true", help="Open in incognito mode")
+    p.add_argument("--focused", type=lambda x: x.lower() != "false", default=None, help="Focus the new window (default: true)")
+    p.set_defaults(func=cmd_create_window)
 
     p = sub.add_parser("create-tab", help="Create a new background tab")
     p.set_defaults(func=cmd_create_tab)
