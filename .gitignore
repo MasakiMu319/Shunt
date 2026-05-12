@@ -13,5 +13,8 @@ yarn-error.log*
 # rust
 host/target/
 
-# typescript (reserved for future ts adoption)
+# typescript
 *.tsbuildinfo
+
+# compiled binary (build with: bun build cli/shunt.ts --compile --outfile cli/shunt)
+cli/shunt

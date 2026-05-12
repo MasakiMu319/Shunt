@@ -12,6 +12,10 @@ default:
 build:
     cd host && cargo build --release
 
+# Build CLI (TypeScript → binary)
+build-cli:
+    cd cli && bun build shunt.ts --compile --outfile shunt
+
 # ─── Setup ────────────────────────────────────────────
 
 # Build + register Native Messaging host for Helium
