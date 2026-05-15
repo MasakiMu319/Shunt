@@ -3,6 +3,12 @@
   "version": "0.1.0",
   "manifest_version": 3,
   "description": "Browser automation transport for Helium — three layers, zero coupling.",
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
   "permissions": [
     "alarms",
     "debugger",
@@ -13,6 +19,12 @@
     "scripting"
   ],
   "action": {
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    },
     "default_popup": "popup.html",
     "default_title": "Shunt"
   },
