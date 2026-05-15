@@ -8,18 +8,19 @@
 // ═══════════════════════════════════════════════════════════════
 
 let port = null;
-let nextId = 1;
-const pendingRequests = new Map(); // id => { resolve, reject, timer }
 
-const REQUEST_TIMEOUT = 30000; // 30s for user-facing requests
-const CDP_TIMEOUT = 10000;     // 10s per CDP command
+const CDP_TIMEOUT = 10000; // 10s per CDP command
 
-function sendResponse(id, result) {
-  if (port) port.postMessage({ jsonrpc: "2.0", result, id });
+function sendResponse(id, result, responsePort = port) {
+  if (responsePort && responsePort === port) {
+    responsePort.postMessage({ jsonrpc: "2.0", result, id });
+  }
 }
 
-function sendError(id, code, message) {
-  if (port) port.postMessage({ jsonrpc: "2.0", error: { code, message }, id });
+function sendError(id, code, message, responsePort = port) {
+  if (responsePort && responsePort === port) {
+    responsePort.postMessage({ jsonrpc: "2.0", error: { code, message }, id });
+  }
 }
 
 function sendNotification(method, params) {
@@ -31,9 +32,9 @@ function sendNotification(method, params) {
 // ═══════════════════════════════════════════════════════════════
 
 const attachedTabs = new Set();
-const tabLocks = new Map();       // tabId => Promise chain
+const tabLocks = new Map(); // tabId => Promise chain
 let tabGroupId = null;
-let groupWindowId = null;         // which window the group is in
+let groupWindowId = null; // which window the group is in
 
 // ═══════════════════════════════════════════════════════════════
 // Per-tab mutex
@@ -43,7 +44,7 @@ async function withTabLock(tabId, fn) {
   const prev = tabLocks.get(tabId) ?? Promise.resolve();
   const next = prev.then(
     () => fn(),
-    (err) => fn(err)
+    (err) => fn(err),
   );
   tabLocks.set(tabId, next);
   try {
@@ -59,7 +60,7 @@ async function withTabLock(tabId, fn) {
 // Tab group management — searches all windows; reuses or migrates
 // ═══════════════════════════════════════════════════════════════
 
-let anchorTabId = null;  // track the placeholder tab to prevent accidental deletion
+let anchorTabId = null; // track the placeholder tab to prevent accidental deletion
 
 async function getOrCreateTabGroup(windowId) {
   // 1. Fast path: in-memory cache hit — verify group still exists
@@ -100,7 +101,9 @@ async function getOrCreateTabGroup(windowId) {
           }
           return tabGroupId;
         }
-      } catch { /* group deleted, continue */ }
+      } catch {
+        /* group deleted, continue */
+      }
     }
   }
 
@@ -120,16 +123,22 @@ async function getOrCreateTabGroup(windowId) {
 
 function cdpSendCommand(tabId, method, params) {
   return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (fn) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      fn();
+    };
     const timer = setTimeout(
-      () => reject(new Error("CDP timeout: " + method + " (" + CDP_TIMEOUT + "ms)")),
-      CDP_TIMEOUT
+      () => finish(() => reject(new Error(`CDP timeout: ${method} (${CDP_TIMEOUT}ms)`))),
+      CDP_TIMEOUT,
     );
     chrome.debugger.sendCommand({ tabId }, method, params || {}, (result) => {
-      clearTimeout(timer);
       if (chrome.runtime.lastError) {
-        reject(new Error(chrome.runtime.lastError.message));
+        finish(() => reject(new Error(chrome.runtime.lastError.message)));
       } else {
-        resolve(result);
+        finish(() => resolve(result));
       }
     });
   });
@@ -145,6 +154,126 @@ function cdpGetTargets() {
       }
     });
   });
+}
+
+async function tabExists(tabId) {
+  try {
+    await chrome.tabs.get(tabId);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function debuggerAttached(tabId) {
+  const targets = await new Promise((resolve, reject) => {
+    chrome.debugger.getTargets((items) => {
+      if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
+      else resolve(items || []);
+    });
+  });
+  return targets.some((target) => target.tabId === tabId && target.attached);
+}
+
+function isRecoverableCdpError(err) {
+  const msg = err?.message || String(err);
+  return /CDP timeout|not attached|No tab with id|Debuggee|detached|closed/i.test(msg);
+}
+
+const RETRYABLE_CDP_METHODS = new Set([
+  "Accessibility.getFullAXTree",
+  "DOM.describeNode",
+  "DOM.getBoxModel",
+  "DOM.getContentQuads",
+  "DOM.getDocument",
+  "DOM.querySelector",
+  "Page.captureScreenshot",
+  "Target.getTargets",
+]);
+
+function isSafeCdpRetry(method) {
+  return RETRYABLE_CDP_METHODS.has(method);
+}
+
+async function detachDebugger(tabId, opts = {}) {
+  if (opts.forget) attachedTabs.delete(tabId);
+  try {
+    await chrome.debugger.detach({ tabId });
+  } catch {
+    /* ok */
+  }
+}
+
+async function enableDebugDomains(tabId) {
+  await cdpSendCommand(tabId, "Page.enable");
+  await cdpSendCommand(tabId, "Network.enable");
+  await cdpSendCommand(tabId, "Runtime.enable");
+  await cdpSendCommand(tabId, "DOM.enable");
+  try {
+    await cdpSendCommand(tabId, "Accessibility.enable");
+  } catch {
+    /* optional */
+  }
+}
+
+async function recoverDebugger(tabId, reason) {
+  console.warn("shunt: recovering debugger", { tabId, reason });
+  await detachDebugger(tabId);
+  if (!(await tabExists(tabId))) {
+    attachedTabs.delete(tabId);
+    throw new Error(`Tab ${tabId} no longer exists`);
+  }
+  try {
+    await chrome.debugger.attach({ tabId }, "1.3");
+    await enableDebugDomains(tabId);
+    attachedTabs.add(tabId);
+  } catch (err) {
+    await detachDebugger(tabId, { forget: true });
+    throw err;
+  }
+}
+
+async function ensureDebuggerReady(tabId) {
+  if (!attachedTabs.has(tabId)) {
+    throw new Error(`Tab ${tabId} not attached. Call attach first.`);
+  }
+  if (!(await tabExists(tabId))) {
+    attachedTabs.delete(tabId);
+    throw new Error(`Tab ${tabId} no longer exists`);
+  }
+  if (!(await debuggerAttached(tabId))) {
+    await recoverDebugger(tabId, "debugger target not attached");
+  }
+}
+
+async function sendCdpWithRecovery(tabId, method, params, opts = {}) {
+  await ensureDebuggerReady(tabId);
+
+  if (method === "Target.getTargets") {
+    return await cdpGetTargets();
+  }
+
+  try {
+    return await cdpSendCommand(tabId, method, params);
+  } catch (err) {
+    if (!opts.retryAfterSend || !isRecoverableCdpError(err) || !isSafeCdpRetry(method)) throw err;
+    await recoverDebugger(tabId, err.message || String(err));
+    return await cdpSendCommand(tabId, method, params);
+  }
+}
+
+async function getLiveAttachedTabs() {
+  const live = [];
+  const stale = [];
+  for (const tabId of Array.from(attachedTabs)) {
+    if (!(await tabExists(tabId))) {
+      attachedTabs.delete(tabId);
+      continue;
+    }
+    if (await debuggerAttached(tabId)) live.push(tabId);
+    else stale.push(tabId);
+  }
+  return { live, stale };
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -166,7 +295,7 @@ async function h_closeWindow(params) {
   // If the Shunt group is in this window, move it to another window first
   if (tabGroupId != null && groupWindowId === windowId) {
     const wins = await chrome.windows.getAll({ populate: false });
-    const other = wins.find(w => w.id !== windowId);
+    const other = wins.find((w) => w.id !== windowId);
     if (other) {
       await chrome.tabGroups.move(tabGroupId, { windowId: other.id, index: -1 });
       groupWindowId = other.id;
@@ -177,7 +306,11 @@ async function h_closeWindow(params) {
       anchorTabId = null;
     }
   }
-  try { await chrome.windows.remove(windowId); } catch { /* ok */ }
+  try {
+    await chrome.windows.remove(windowId);
+  } catch {
+    /* ok */
+  }
   return { windowId };
 }
 
@@ -204,10 +337,13 @@ async function h_closeTab(params) {
   }
   return withTabLock(tabId, async () => {
     if (attachedTabs.has(tabId)) {
-      try { await chrome.debugger.detach({ tabId }); } catch { /* ok */ }
-      attachedTabs.delete(tabId);
+      await detachDebugger(tabId, { forget: true });
     }
-    try { await chrome.tabs.remove(tabId); } catch { /* ok */ }
+    try {
+      await chrome.tabs.remove(tabId);
+    } catch {
+      /* ok */
+    }
     return { tabId };
   });
 }
@@ -216,17 +352,21 @@ async function h_attach(params) {
   const { tabId } = params;
   return withTabLock(tabId, async () => {
     if (attachedTabs.has(tabId)) {
-      return { tabId, alreadyAttached: true };
+      if ((await tabExists(tabId)) && (await debuggerAttached(tabId))) {
+        return { tabId, alreadyAttached: true, verified: true };
+      }
+      attachedTabs.delete(tabId);
     }
-    await chrome.debugger.attach({ tabId }, "1.3");
-    attachedTabs.add(tabId);
-    // Enable useful domains
-    await cdpSendCommand(tabId, "Page.enable");
-    await cdpSendCommand(tabId, "Network.enable");
-    await cdpSendCommand(tabId, "Runtime.enable");
-    await cdpSendCommand(tabId, "DOM.enable");
-    try { await cdpSendCommand(tabId, "Accessibility.enable"); } catch { /* optional */ }
-    return { tabId, attached: true };
+
+    try {
+      await chrome.debugger.attach({ tabId }, "1.3");
+      await enableDebugDomains(tabId);
+      attachedTabs.add(tabId);
+      return { tabId, attached: true };
+    } catch (err) {
+      await detachDebugger(tabId, { forget: true });
+      throw err;
+    }
   });
 }
 
@@ -234,8 +374,7 @@ async function h_detach(params) {
   const { tabId } = params;
   return withTabLock(tabId, async () => {
     if (attachedTabs.has(tabId)) {
-      try { await chrome.debugger.detach({ tabId }); } catch { /* ok */ }
-      attachedTabs.delete(tabId);
+      await detachDebugger(tabId, { forget: true });
     }
     return { tabId };
   });
@@ -244,15 +383,9 @@ async function h_detach(params) {
 async function h_executeCdp(params) {
   const { tabId, method, params: cdpParams } = params;
   return withTabLock(tabId, async () => {
-    if (!attachedTabs.has(tabId)) {
-      throw new Error("Tab " + tabId + " not attached. Call attach first.");
-    }
-    let result;
-    if (method === "Target.getTargets") {
-      result = await cdpGetTargets();
-    } else {
-      result = await cdpSendCommand(tabId, method, cdpParams);
-    }
+    const result = await sendCdpWithRecovery(tabId, method, cdpParams, {
+      retryAfterSend: isSafeCdpRetry(method),
+    });
     return { tabId, method, result };
   });
 }
@@ -260,14 +393,13 @@ async function h_executeCdp(params) {
 async function h_screenshot(params) {
   const { tabId, format, quality, clip, fromSurface } = params || {};
   return withTabLock(tabId, async () => {
-    if (!attachedTabs.has(tabId)) {
-      throw new Error("Tab " + tabId + " not attached.");
-    }
     const p = { format: format || "png" };
     if (quality != null) p.quality = quality;
     if (clip) p.clip = clip;
     if (fromSurface != null) p.fromSurface = fromSurface;
-    const result = await cdpSendCommand(tabId, "Page.captureScreenshot", p);
+    const result = await sendCdpWithRecovery(tabId, "Page.captureScreenshot", p, {
+      retryAfterSend: true,
+    });
     return { tabId, data: result.data, format: p.format };
   });
 }
@@ -275,18 +407,22 @@ async function h_screenshot(params) {
 async function h_click(params) {
   const { tabId, x, y, button, clickCount } = params;
   return withTabLock(tabId, async () => {
-    if (!attachedTabs.has(tabId)) {
-      throw new Error("Tab " + tabId + " not attached.");
-    }
+    await ensureDebuggerReady(tabId);
     // Mouse move before click to position cursor
     await cdpSendCommand(tabId, "Input.dispatchMouseEvent", {
-      type: "mouseMoved", x, y, button: "none", buttons: 0, modifiers: 0,
+      type: "mouseMoved",
+      x,
+      y,
+      button: "none",
+      buttons: 0,
+      modifiers: 0,
     });
     const btn = button || "left";
     const btnMask = btn === "left" ? 1 : btn === "right" ? 2 : 4;
     const args = {
       type: "mousePressed",
-      x, y,
+      x,
+      y,
       button: btn,
       buttons: btnMask,
       clickCount: clickCount || 1,
@@ -302,9 +438,7 @@ async function h_click(params) {
 async function h_type(params) {
   const { tabId, text } = params;
   return withTabLock(tabId, async () => {
-    if (!attachedTabs.has(tabId)) {
-      throw new Error("Tab " + tabId + " not attached.");
-    }
+    await ensureDebuggerReady(tabId);
     for (const ch of text) {
       await cdpSendCommand(tabId, "Input.dispatchKeyEvent", {
         type: "char",
@@ -319,9 +453,7 @@ async function h_type(params) {
 async function h_scroll(params) {
   const { tabId, x, y, deltaX, deltaY } = params;
   return withTabLock(tabId, async () => {
-    if (!attachedTabs.has(tabId)) {
-      throw new Error("Tab " + tabId + " not attached.");
-    }
+    await ensureDebuggerReady(tabId);
     await cdpSendCommand(tabId, "Input.dispatchMouseEvent", {
       type: "mouseWheel",
       x: x || 0,
@@ -353,22 +485,26 @@ async function h_activateTab(params) {
   return { tabId };
 }
 
-
 async function h_getSession() {
+  const { live, stale } = await getLiveAttachedTabs();
   return {
     groupWindowId,
     tabGroupId,
     anchorTabId,
-    attachedTabs: Array.from(attachedTabs),
+    attachedTabs: live,
+    staleAttachedTabs: stale,
   };
 }
 
 async function h_getStatus() {
+  const { live, stale } = await getLiveAttachedTabs();
   return {
     connected: true,
     nativeHost: port ? "connected" : "disconnected",
-    attachedTabs: Array.from(attachedTabs),
-    attachedCount: attachedTabs.size,
+    attachedTabs: live,
+    attachedCount: live.length,
+    staleAttachedTabs: stale,
+    staleAttachedCount: stale.length,
     groupWindowId,
     tabGroupId,
     anchorTabId,
@@ -385,7 +521,7 @@ async function h_finalizeTabs(params) {
   }
 
   // Detach tabs not in keep list
-  for (const tabId of attachedTabs) {
+  for (const tabId of Array.from(attachedTabs)) {
     if (!keepSet.has(tabId)) {
       await h_detach({ tabId });
     }
@@ -396,7 +532,11 @@ async function h_finalizeTabs(params) {
     const tabs = await chrome.tabs.query({ groupId: tabGroupId });
     for (const tab of tabs) {
       if (!keepSet.has(tab.id)) {
-        try { await chrome.tabs.remove(tab.id); } catch { /* ok */ }
+        try {
+          await chrome.tabs.remove(tab.id);
+        } catch {
+          /* ok */
+        }
       }
     }
   }
@@ -406,8 +546,6 @@ async function h_finalizeTabs(params) {
 async function h_findElement(params) {
   const { tabId, text, selector } = params;
   return withTabLock(tabId, async () => {
-    if (!attachedTabs.has(tabId)) throw new Error("Tab " + tabId + " not attached.");
-
     let expression;
     if (text) {
       const escaped = text.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
@@ -438,7 +576,7 @@ async function h_findElement(params) {
       throw new Error("Must provide text or selector");
     }
 
-    const result = await cdpSendCommand(tabId, "Runtime.evaluate", {
+    const result = await sendCdpWithRecovery(tabId, "Runtime.evaluate", {
       expression,
       returnByValue: true,
       awaitPromise: false,
@@ -453,49 +591,46 @@ async function h_findElement(params) {
 async function h_getPageText(params) {
   const { tabId, maxLength } = params || {};
   return withTabLock(tabId, async () => {
-    if (!attachedTabs.has(tabId)) throw new Error("Tab " + tabId + " not attached.");
-    const result = await cdpSendCommand(tabId, "Runtime.evaluate", {
+    const result = await sendCdpWithRecovery(tabId, "Runtime.evaluate", {
       expression: "document.body?.innerText || ''",
       returnByValue: true,
     });
-    let text = result.result?.value || '';
+    let text = result.result?.value || "";
     const limit = maxLength || 10000;
-    if (text.length > limit) text = text.substring(0, limit) + '...';
+    if (text.length > limit) text = `${text.substring(0, limit)}...`;
     return { tabId, text, truncated: text.length >= limit };
   });
 }
-
-
 
 // ═══════════════════════════════════════════════════════════════
 // Handler router
 // ═══════════════════════════════════════════════════════════════
 
 const handlers = {
-  createWindow:  h_createWindow,
-  closeWindow:   h_closeWindow,
-  createTab:     h_createTab,
-  closeTab:      h_closeTab,
-  attach:        h_attach,
-  detach:        h_detach,
-  executeCdp:    h_executeCdp,
-  screenshot:    h_screenshot,
-  click:         h_click,
-  type:          h_type,
-  scroll:        h_scroll,
-  getUserTabs:   h_getUserTabs,
-  activateTab:   h_activateTab,
-  getSession:    h_getSession,
-  getStatus:     h_getStatus,
-  finalizeTabs:  h_finalizeTabs,
-  findElement:   h_findElement,
-  getPageText:   h_getPageText,
-  ping:          h_ping,
+  createWindow: h_createWindow,
+  closeWindow: h_closeWindow,
+  createTab: h_createTab,
+  closeTab: h_closeTab,
+  attach: h_attach,
+  detach: h_detach,
+  executeCdp: h_executeCdp,
+  screenshot: h_screenshot,
+  click: h_click,
+  type: h_type,
+  scroll: h_scroll,
+  getUserTabs: h_getUserTabs,
+  activateTab: h_activateTab,
+  getSession: h_getSession,
+  getStatus: h_getStatus,
+  finalizeTabs: h_finalizeTabs,
+  findElement: h_findElement,
+  getPageText: h_getPageText,
+  ping: h_ping,
 };
 
 // Notification handlers (one-way, no id)
 function handleNotification(msg) {
-  const { method, params } = msg;
+  const { method } = msg;
   switch (method) {
     case "heartbeat":
       lastHeartbeat = Date.now();
@@ -504,7 +639,13 @@ function handleNotification(msg) {
   }
 }
 
-async function handleRequest(msg) {
+function recordNativeActivity() {
+  lastHeartbeat = Date.now();
+  if (!heartbeatArmed) startHeartbeat();
+}
+
+async function handleRequest(msg, responsePort) {
+  recordNativeActivity();
   const { id, method, params } = msg;
   if (id == null) {
     handleNotification(msg);
@@ -512,14 +653,14 @@ async function handleRequest(msg) {
   }
   const handler = handlers[method];
   if (!handler) {
-    sendError(id, -1, "Method not found: " + method);
+    sendError(id, -1, `Method not found: ${method}`, responsePort);
     return;
   }
   try {
     const result = await handler(params);
-    sendResponse(id, result);
+    sendResponse(id, result, responsePort);
   } catch (err) {
-    sendError(id, -2, err.message || String(err));
+    sendError(id, -2, err.message || String(err), responsePort);
   }
 }
 
@@ -543,8 +684,6 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
 
 chrome.debugger.onDetach.addListener((source, reason) => {
   if (source.tabId) {
-    attachedTabs.delete(source.tabId);
-    tabLocks.delete(source.tabId);
     sendNotification("debuggerDetached", {
       tabId: source.tabId,
       reason,
@@ -557,9 +696,9 @@ chrome.debugger.onDetach.addListener((source, reason) => {
 // ═══════════════════════════════════════════════════════════════
 
 const HEARTBEAT_NAME = "shunt-heartbeat";
-const HEARTBEAT_CHECK_PERIOD = 10;  // seconds — check every 10s
-const HEARTBEAT_GRACE     = 45;  // seconds — grace period before cleanup on first connect
-const HEARTBEAT_TIMEOUT   = 35;  // seconds — cleanup if no heartbeat this long
+const HEARTBEAT_CHECK_PERIOD = 30; // seconds — MV3 alarms must be at least 30s
+const HEARTBEAT_GRACE = 60; // seconds — grace period before cleanup on first connect
+const HEARTBEAT_TIMEOUT = 90; // seconds — cleanup if no activity this long
 
 let lastHeartbeat = Date.now();
 let heartbeatArmed = false;
@@ -577,11 +716,9 @@ function stopHeartbeat() {
 
 async function cleanup(reason) {
   console.warn("shunt: cleanup —", reason);
-  for (const tabId of attachedTabs) {
-    try { await chrome.debugger.detach({ tabId }); } catch { /* ok */ }
+  for (const tabId of Array.from(attachedTabs)) {
+    await detachDebugger(tabId, { forget: true });
   }
-  attachedTabs.clear();
-  tabLocks.clear();
 }
 
 // Connectivity check (simple round-trip, no side effects)
@@ -592,6 +729,11 @@ function h_ping() {
 // Heartbeat received from CLI via notification
 
 chrome.alarms.onAlarm.addListener(async (alarm) => {
+  if (alarm.name === NATIVE_RECONNECT_NAME) {
+    if (!port) connect();
+    return;
+  }
+
   if (alarm.name !== HEARTBEAT_NAME || !heartbeatArmed) return;
 
   const elapsed = (Date.now() - lastHeartbeat) / 1000;
@@ -604,8 +746,8 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
     await cleanup("heartbeat timeout");
     sendNotification("statusReport", {
       report: {
-        nativeHost: "unreachable",
-        connected: false,
+        nativeHost: port ? "connected" : "unreachable",
+        connected: !!port,
         attachedTabs: [],
         attachedCount: 0,
       },
@@ -617,29 +759,45 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
 // Native Messaging connection
 // ═══════════════════════════════════════════════════════════════
 
-function connect() {
-  try {
-    port = chrome.runtime.connectNative("com.opensetsuna.shunt");
+const NATIVE_RECONNECT_NAME = "shunt-native-reconnect";
+const NATIVE_RECONNECT_PERIOD = 30; // seconds — MV3 alarms must be at least 30s
 
-    port.onMessage.addListener((msg) => {
-      handleRequest(msg).catch((err) => {
+function scheduleNativeReconnect() {
+  chrome.alarms.create(NATIVE_RECONNECT_NAME, { periodInMinutes: NATIVE_RECONNECT_PERIOD / 60 });
+}
+
+function stopNativeReconnect() {
+  chrome.alarms.clear(NATIVE_RECONNECT_NAME);
+}
+
+function connect() {
+  if (port) return;
+  try {
+    const nextPort = chrome.runtime.connectNative("com.opensetsuna.shunt");
+    port = nextPort;
+
+    nextPort.onMessage.addListener((msg) => {
+      handleRequest(msg, nextPort).catch((err) => {
         console.error("shunt: handler error", err);
       });
     });
 
-    port.onDisconnect.addListener(async () => {
-      console.warn("shunt: host diconnected, triggering cleanup");
+    nextPort.onDisconnect.addListener(async () => {
+      if (port !== nextPort) return;
+      console.warn("shunt: host disconnected, triggering cleanup");
       stopHeartbeat();
       await cleanup("native host disconnected");
       port = null;
-      setTimeout(connect, 1000);
+      scheduleNativeReconnect();
     });
 
+    stopNativeReconnect();
     startHeartbeat();
     console.log("shunt: connected");
   } catch (err) {
+    port = null;
     console.error("shunt: connect failed", err);
-    setTimeout(connect, 5000);
+    scheduleNativeReconnect();
   }
 }
 
@@ -647,19 +805,32 @@ function connect() {
 // Popup (chrome.runtime.onMessage)
 // ═══════════════════════════════════════════════════════════════
 
-chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   const { id, method } = msg;
-  if (id == null) { sendResponse(null); return false; }
-  const handler = handlers[method];
-  if (!handler) {
-    sendResponse({ jsonrpc: "2.0", id, error: { code: -1, message: "Method not found: " + method } });
+  if (id == null) {
+    sendResponse(null);
     return false;
   }
-  handler(msg.params).then((result) => {
-    sendResponse({ jsonrpc: "2.0", id, result });
-  }).catch((err) => {
-    sendResponse({ jsonrpc: "2.0", id, error: { code: -2, message: err.message || String(err) } });
-  });
+  const handler = handlers[method];
+  if (!handler) {
+    sendResponse({
+      jsonrpc: "2.0",
+      id,
+      error: { code: -1, message: `Method not found: ${method}` },
+    });
+    return false;
+  }
+  handler(msg.params)
+    .then((result) => {
+      sendResponse({ jsonrpc: "2.0", id, result });
+    })
+    .catch((err) => {
+      sendResponse({
+        jsonrpc: "2.0",
+        id,
+        error: { code: -2, message: err.message || String(err) },
+      });
+    });
   return true; // async
 });
 
@@ -667,4 +838,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 // Startup
 // ═══════════════════════════════════════════════════════════════
 
+chrome.runtime.onStartup?.addListener(connect);
+chrome.runtime.onInstalled?.addListener(connect);
+scheduleNativeReconnect();
 connect();

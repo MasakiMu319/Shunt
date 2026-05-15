@@ -4,6 +4,7 @@
  * Browser automation client via JSON-RPC 2.0 over Unix socket → Extension
  */
 
+import { randomUUID } from "node:crypto";
 import { type Socket, createConnection } from "node:net";
 
 // ── Config ────────────────────────────────────────────────────────────────
@@ -16,6 +17,10 @@ const CDP_POLL_INTERVAL = 500;
 const CDP_POLL_MAX = 30;
 const MIN_CDP_HTML = 500;
 const HEARTBEAT_INTERVAL = 30_000;
+const CONNECT_TIMEOUT_MS = 3_000;
+const RPC_TIMEOUT_MS = 15_000;
+const CDP_FALLBACK_BUDGET_MS = 45_000;
+const MAX_CDP_TRANSPORT_FAILURES = 2;
 
 // Domains where HTTP fetch returns empty/SPA shells → skip to CDP
 const CDP_FIRST_DOMAINS = new Set([
@@ -60,21 +65,68 @@ const CDP_TEXT_EXPR = "document.body.innerText";
 
 class ShuntRPC {
   private sock: Socket | null = null;
+  private connectPromise: Promise<Socket> | null = null;
+  private readonly clientId = randomUUID();
   private nextId = 1;
 
-  connect(): Socket {
-    if (this.sock) return this.sock;
-    try {
-      this.sock = createConnection(SOCKET_PATH);
-      this.sock.setTimeout(5_000);
-    } catch {
-      throw new Error(
-        "Shunt not running. Is Helium open with Shunt extension loaded?\n" +
-          "  open -a Helium → chrome://extensions → Load Unpacked → .../Shunt/extension",
-      );
-    }
-    this.sock.on("error", () => {});
-    return this.sock;
+  async connect(): Promise<Socket> {
+    if (this.sock && !this.sock.destroyed) return this.sock;
+    if (this.connectPromise) return this.connectPromise;
+
+    this.connectPromise = new Promise((resolve, reject) => {
+      const s = createConnection(SOCKET_PATH);
+      let settled = false;
+
+      const fail = (message: string) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        try { s.destroy(); } catch { /* ok */ }
+        this.sock = null;
+        reject(new Error(
+          message + "\n" +
+            "Shunt not running. Is Helium open with Shunt extension loaded?\n" +
+            "  open -a Helium → chrome://extensions → Load Unpacked → .../Shunt/extension",
+        ));
+      };
+
+      const timer = setTimeout(() => {
+        fail(`Connection timeout after ${CONNECT_TIMEOUT_MS}ms (${SOCKET_PATH})`);
+      }, CONNECT_TIMEOUT_MS);
+
+      const cleanup = () => {
+        clearTimeout(timer);
+        s.off("connect", onConnect);
+        s.off("error", onError);
+        s.off("close", onCloseBeforeConnect);
+      };
+
+      const onConnect = () => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        this.sock = s;
+        s.on("error", () => { this.sock = null; });
+        s.on("close", () => { this.sock = null; });
+        resolve(s);
+      };
+
+      const onError = (err: Error) => {
+        fail(`Connection error: ${err.message}`);
+      };
+
+      const onCloseBeforeConnect = () => {
+        fail("Socket closed before connection completed");
+      };
+
+      s.once("connect", onConnect);
+      s.once("error", onError);
+      s.once("close", onCloseBeforeConnect);
+    }).finally(() => {
+      this.connectPromise = null;
+    });
+
+    return this.connectPromise;
   }
 
   close(): void {
@@ -85,8 +137,8 @@ class ShuntRPC {
   }
 
   async call(method: string, params?: unknown): Promise<unknown> {
-    const s = this.connect();
-    const id = this.nextId++;
+    const s = await this.connect();
+    const id = `${this.clientId}:${this.nextId++}`;
 
     const msg: Record<string, unknown> = { jsonrpc: "2.0", method, id };
     if (params !== undefined) msg.params = params;
@@ -95,6 +147,20 @@ class ShuntRPC {
 
     return new Promise((resolve, reject) => {
       let buf = "";
+      let settled = false;
+
+      const timer = setTimeout(() => {
+        cleanup();
+        this.close();
+        reject(new Error(`RPC timeout waiting for ${method} (${RPC_TIMEOUT_MS}ms)`));
+      }, RPC_TIMEOUT_MS);
+
+      const finish = (fn: () => void) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        fn();
+      };
 
       const onData = (chunk: Buffer) => {
         buf += chunk.toString();
@@ -106,12 +172,11 @@ class ShuntRPC {
           try {
             const resp = JSON.parse(line);
             if (resp.id === id) {
-              cleanup();
               if (resp.error) {
                 const err = resp.error as { code?: number; message?: string };
-                reject(new Error(`[${err.code ?? "?"}] ${err.message ?? "unknown"}`));
+                finish(() => reject(new Error(`[${err.code ?? "?"}] ${err.message ?? "unknown"}`)));
               } else {
-                resolve(resp.result);
+                finish(() => resolve(resp.result));
               }
               return;
             }
@@ -120,16 +185,15 @@ class ShuntRPC {
       };
 
       const onError = (err: Error) => {
-        cleanup();
-        reject(new Error(`Connection error: ${err.message}`));
+        finish(() => reject(new Error(`Connection error: ${err.message}`)));
       };
 
       const onClose = () => {
-        cleanup();
-        reject(new Error("Socket closed before response"));
+        finish(() => reject(new Error("Socket closed before response")));
       };
 
       function cleanup() {
+        clearTimeout(timer);
         s.off("data", onData);
         s.off("error", onError);
         s.off("close", onClose);
@@ -139,8 +203,10 @@ class ShuntRPC {
       s.once("error", onError);
       s.once("close", onClose);
 
-      if (!s.write(payload)) {
-        s.once("drain", () => {});
+      try {
+        s.write(payload);
+      } catch (err) {
+        finish(() => reject(err instanceof Error ? err : new Error(String(err))));
       }
     });
   }
@@ -150,10 +216,28 @@ class ShuntRPC {
 function sendHeartbeat(): void {
   try {
     const s = createConnection(SOCKET_PATH);
+    let settled = false;
+
+    const cleanup = () => {
+      if (settled) return;
+      settled = true;
+      s.off("connect", onConnect);
+      s.off("error", cleanup);
+      s.off("timeout", cleanup);
+      s.off("close", cleanup);
+      try { s.destroy(); } catch { /* ok */ }
+    };
+
+    const onConnect = () => {
+      if (settled) return;
+      s.write(JSON.stringify({ jsonrpc: "2.0", method: "heartbeat" }) + "\n", cleanup);
+    };
+
     s.setTimeout(3_000);
-    s.write(JSON.stringify({ jsonrpc: "2.0", method: "heartbeat" }) + "\n", () => {
-      s.destroy();
-    });
+    s.once("connect", onConnect);
+    s.once("error", cleanup);
+    s.once("timeout", cleanup);
+    s.once("close", cleanup);
   } catch { /* silent */ }
 }
 
@@ -203,6 +287,16 @@ function isBlockPage(html: string, text: string): boolean {
   // text-to-html ratio: if extracted text is tiny relative to html size
   if (html.length > 5000 && text.length / html.length < BLOCK_RATIO_THRESHOLD) return true;
   return false;
+}
+
+function isTransportFailure(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err);
+  return /Connection error|Connection timeout|RPC timeout|Socket closed|Shunt not running|ECONNREFUSED|ENOENT|EPIPE/i.test(message);
+}
+
+function isCdpHealthFailure(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err);
+  return isTransportFailure(err) || /CDP timeout|debugger target not attached|not attached|no longer exists/i.test(message);
 }
 
 type ReadMode = "raw" | "defuddle" | "text";
@@ -272,30 +366,41 @@ async function readPage(url: string, opts?: {
   // ── Phase 2: CDP fallback ───────────────────────────────────────────
   const rpc = new ShuntRPC();
   let tabId = 0;
+  let cdpHealthFailures = 0;
+  const cdpDeadline = Date.now() + CDP_FALLBACK_BUDGET_MS;
+  const callCdp = async (method: string, params?: unknown) => {
+    if (Date.now() > cdpDeadline) {
+      throw new Error(`CDP fallback exceeded ${CDP_FALLBACK_BUDGET_MS}ms budget`);
+    }
+    return await rpc.call("executeCdp", { tabId, method, params });
+  };
+
   try {
     const create = (await rpc.call("createTab")) as { tabId: number };
     tabId = create.tabId;
     await rpc.call("attach", { tabId });
-    await rpc.call("executeCdp", { tabId, method: "Page.navigate", params: { url } });
+    await callCdp("Page.navigate", { url });
 
     const waitExpr = `(() => (${CDP_WAIT_EXPR}))()`;
     let contentReady = false;
-    for (let i = 0; i < CDP_POLL_MAX; i++) {
+    for (let i = 0; i < CDP_POLL_MAX && Date.now() <= cdpDeadline; i++) {
       await Bun.sleep(CDP_POLL_INTERVAL);
       try {
-        const poll = (await rpc.call("executeCdp", {
-          tabId, method: "Runtime.evaluate",
-          params: { expression: waitExpr, returnByValue: true },
+        const poll = (await callCdp("Runtime.evaluate", {
+          expression: waitExpr,
+          returnByValue: true,
         })) as { result?: { result?: { value?: unknown } } };
         if (poll.result?.result?.value === true) { contentReady = true; break; }
-      } catch { /* keep polling */ }
+      } catch (err) {
+        if (isCdpHealthFailure(err) && ++cdpHealthFailures >= MAX_CDP_TRANSPORT_FAILURES) throw err;
+      }
     }
 
     // Mode: text — get body.innerText directly, bypass defuddle
     if (opts?.mode === "text") {
-      const textResult = (await rpc.call("executeCdp", {
-        tabId, method: "Runtime.evaluate",
-        params: { expression: CDP_TEXT_EXPR, returnByValue: true },
+      const textResult = (await callCdp("Runtime.evaluate", {
+        expression: CDP_TEXT_EXPR,
+        returnByValue: true,
       })) as { result?: { result?: { value?: string } } };
       const text = textResult.result?.result?.value ?? "";
       if (!text || text.length < 50) throw new Error("CDP text mode returned insufficient content");
@@ -306,9 +411,9 @@ async function readPage(url: string, opts?: {
       };
     }
 
-    const htmlResult = (await rpc.call("executeCdp", {
-      tabId, method: "Runtime.evaluate",
-      params: { expression: CDP_EXTRACT_EXPR, returnByValue: true },
+    const htmlResult = (await callCdp("Runtime.evaluate", {
+      expression: CDP_EXTRACT_EXPR,
+      returnByValue: true,
     })) as { result?: { result?: { value?: string } } };
 
     html = htmlResult.result?.result?.value ?? "";
@@ -520,6 +625,11 @@ async function cmd_status(rpc: ShuntRPC) {
     console.log(`  tab group:    ${status.tabGroupId ?? "?"}`);
     const attached = (status.attachedTabs as number[]) ?? [];
     console.log(`  attached (${attached.length}): ${attached.length ? attached.join(",") : "none"}`);
+    const staleAttached = (status.staleAttachedTabs as number[]) ?? [];
+    const staleAttachedCount = Number(status.staleAttachedCount ?? staleAttached.length);
+    console.log(
+      `  stale attached (${staleAttachedCount}): ${staleAttached.length ? staleAttached.join(",") : "none"}`,
+    );
 
     try {
       const tabsRes = (await rpc.call("getUserTabs")) as { tabs?: Array<{ id: number; url: string; active?: boolean }> };
@@ -527,8 +637,9 @@ async function cmd_status(rpc: ShuntRPC) {
       console.log(`  browser tabs (${tabs.length}):`);
       for (const t of tabs.slice(0, 10)) {
         const url = (t.url ?? "").slice(0, 60);
-        const active = t.active ? " \u25C0 active" : "";
-        const att = attached.includes(t.id) ? " [attached]" : "";
+        const active = t.active ? " ◀ active" : "";
+        const stale = staleAttached.includes(t.id) ? " [stale]" : "";
+        const att = attached.includes(t.id) ? " [attached]" : stale;
         console.log(`    ${t.id} ${url}${att}${active}`);
       }
       if (tabs.length > 10) console.log(`    ... (${tabs.length - 10} more)`);
