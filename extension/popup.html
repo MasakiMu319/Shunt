@@ -1,21 +1,166 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <style>
-  body { width: 280px; margin: 0; padding: 12px; font: 13px system-ui; color: #ddd; background: #1e1e2e; }
-  h2 { margin: 0 0 8px; font-size: 14px; }
-  .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; }
-  .badge-ok { background: #a6e3a1; color: #1e1e2e; }
-  .badge-err { background: #f38ba8; color: #1e1e2e; }
-  .section { margin: 10px 0; padding: 8px; background: #313244; border-radius: 6px; }
-  .label { color: #bac2de; font-size: 11px; }
-  .val { color: #cdd6f4; }
-  .row { display: flex; justify-content: space-between; align-items: center; margin: 3px 0; }
-  .tab-url { font-size: 11px; color: #a6adc8; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 200px; }
-  .attached { color: #a6e3a1; }
-  button { width: 100%; padding: 6px; margin-top: 6px; border: none; border-radius: 4px; background: #585b70; color: #cdd6f4; cursor: pointer; font-size: 12px; }
-  button:hover { background: #6c7086; }
+  :root {
+    color-scheme: light dark;
+    --bg: oklch(97% 0.012 250);
+    --surface: oklch(100% 0 0);
+    --surface-muted: oklch(94% 0.014 250);
+    --border: oklch(86% 0.018 250);
+    --text: oklch(24% 0.025 250);
+    --muted: oklch(48% 0.028 250);
+    --quiet: oklch(60% 0.025 250);
+    --ok-bg: oklch(91% 0.055 150);
+    --ok-text: oklch(33% 0.075 150);
+    --err-bg: oklch(92% 0.052 25);
+    --err-text: oklch(39% 0.09 25);
+    --button-bg: oklch(90% 0.018 250);
+    --button-hover: oklch(85% 0.022 250);
+    --focus: oklch(57% 0.12 250);
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: oklch(18% 0.014 250);
+      --surface: oklch(23% 0.016 250);
+      --surface-muted: oklch(28% 0.018 250);
+      --border: oklch(34% 0.02 250);
+      --text: oklch(90% 0.018 250);
+      --muted: oklch(70% 0.024 250);
+      --quiet: oklch(56% 0.024 250);
+      --ok-bg: oklch(30% 0.06 150);
+      --ok-text: oklch(82% 0.08 150);
+      --err-bg: oklch(31% 0.065 25);
+      --err-text: oklch(84% 0.075 25);
+      --button-bg: oklch(31% 0.018 250);
+      --button-hover: oklch(37% 0.022 250);
+      --focus: oklch(75% 0.1 250);
+    }
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    width: 280px;
+    margin: 0;
+    padding: 12px;
+    font: 13px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    color: var(--text);
+    background: var(--bg);
+  }
+
+  h2 {
+    margin: 0 0 10px;
+    font-size: 15px;
+    font-weight: 650;
+    letter-spacing: 0;
+  }
+
+  .badge {
+    display: inline-flex;
+    align-items: center;
+    min-height: 20px;
+    padding: 2px 8px;
+    border: 1px solid transparent;
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 650;
+    line-height: 1;
+  }
+
+  .badge-ok {
+    background: var(--ok-bg);
+    color: var(--ok-text);
+    border-color: color-mix(in oklch, var(--ok-text) 20%, transparent);
+  }
+
+  .badge-err {
+    background: var(--err-bg);
+    color: var(--err-text);
+    border-color: color-mix(in oklch, var(--err-text) 20%, transparent);
+  }
+
+  .section {
+    margin: 10px 0;
+    padding: 9px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+  }
+
+  .section-title {
+    margin-bottom: 6px;
+  }
+
+  .label {
+    color: var(--muted);
+    font-size: 11px;
+    font-weight: 550;
+  }
+
+  .val {
+    color: var(--text);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 10px;
+    min-height: 24px;
+    margin: 2px 0;
+  }
+
+  .tab-url {
+    max-width: 218px;
+    color: var(--muted);
+    font-size: 11px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .attached {
+    color: var(--ok-text);
+    font-size: 12px;
+    line-height: 1;
+  }
+
+  .empty {
+    color: var(--quiet);
+    font-size: 12px;
+  }
+
+  .error {
+    color: var(--err-text);
+    font-size: 12px;
+  }
+
+  button {
+    width: 100%;
+    min-height: 30px;
+    padding: 6px 10px;
+    margin-top: 6px;
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    background: var(--button-bg);
+    color: var(--text);
+    cursor: pointer;
+    font-size: 12px;
+    font-weight: 600;
+  }
+
+  button:hover {
+    background: var(--button-hover);
+  }
+
+  button:focus-visible {
+    outline: 2px solid var(--focus);
+    outline-offset: 2px;
+  }
 </style>
 </head>
 <body>
@@ -27,10 +172,10 @@
   <div class="row"><span class="label">Tab Group</span><span class="val" id="grp">—</span></div>
 </div>
 <div class="section">
-  <div class="label" style="margin-bottom:4px">Attached Tabs</div>
-  <div id="tabs"><span style="color:#6c7086">—</span></div>
+  <div class="label section-title">Attached Tabs</div>
+  <div id="tabs"><span class="empty">—</span></div>
 </div>
-<button id="refresh">Refresh</button>
+<button id="refresh" type="button">Refresh</button>
 <script src="popup.js"></script>
 </body>
 </html>
