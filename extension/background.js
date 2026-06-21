@@ -480,8 +480,15 @@ async function h_getUserTabs() {
 
 async function h_activateTab(params) {
   const { tabId } = params;
-  // Only make tab active within its own window — don't steal focus
+  const tab = await chrome.tabs.get(tabId);
+  // Expand the containing tab group + focus its window so
+  // document.visibilityState transitions to "visible" (rAF unthrottled).
+  // Required for any task that exercises animation/game loops.
+  if (tab.groupId !== chrome.tabGroups.TAB_GROUP_ID_NONE) {
+    await chrome.tabGroups.update(tab.groupId, { collapsed: false });
+  }
   await chrome.tabs.update(tabId, { active: true });
+  await chrome.windows.update(tab.windowId, { focused: true });
   return { tabId };
 }
 
