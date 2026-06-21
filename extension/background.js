@@ -770,6 +770,11 @@ function stopNativeReconnect() {
   chrome.alarms.clear(NATIVE_RECONNECT_NAME);
 }
 
+function reconnectNative() {
+  scheduleNativeReconnect();
+  connect();
+}
+
 function connect() {
   if (port) return;
   try {
@@ -788,7 +793,7 @@ function connect() {
       stopHeartbeat();
       await cleanup("native host disconnected");
       port = null;
-      scheduleNativeReconnect();
+      reconnectNative();
     });
 
     stopNativeReconnect();
