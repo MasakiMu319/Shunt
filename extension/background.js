@@ -62,7 +62,22 @@ async function withTabLock(tabId, fn) {
 
 let anchorTabId = null; // track the placeholder tab to prevent accidental deletion
 
+let groupLock = Promise.resolve();
+
 async function getOrCreateTabGroup(windowId) {
+  return new Promise((resolve, reject) => {
+    groupLock = groupLock.then(async () => {
+      try {
+        const gid = await getOrCreateTabGroupInternal(windowId);
+        resolve(gid);
+      } catch (err) {
+        reject(err);
+      }
+    });
+  });
+}
+
+async function getOrCreateTabGroupInternal(windowId) {
   // 1. Fast path: in-memory cache hit — verify group still exists
   if (tabGroupId != null) {
     try {
@@ -98,6 +113,16 @@ async function getOrCreateTabGroup(windowId) {
           if (group.windowId !== windowId) {
             await chrome.tabGroups.move(tabGroupId, { windowId, index: -1 });
             groupWindowId = windowId;
+          }
+          // Ensure we have an anchor tab tracked
+          if (anchorTabId == null) {
+            const anchor = await chrome.tabs.create({
+              windowId,
+              url: "about:blank",
+              active: false,
+            });
+            await chrome.tabs.group({ tabIds: [anchor.id], groupId: tabGroupId });
+            anchorTabId = anchor.id;
           }
           return tabGroupId;
         }
@@ -467,15 +492,28 @@ async function h_scroll(params) {
 
 async function h_getUserTabs() {
   const tabs = await chrome.tabs.query({});
-  return {
-    tabs: tabs.map((t) => ({
+  const tabList = [];
+  for (const t of tabs) {
+    let groupTitle = null;
+    if (t.groupId !== chrome.tabGroups.TAB_GROUP_ID_NONE) {
+      try {
+        const g = await chrome.tabGroups.get(t.groupId);
+        groupTitle = g ? g.title : null;
+      } catch {
+        /* ok */
+      }
+    }
+    tabList.push({
       id: t.id,
       title: t.title,
       url: t.url,
       active: t.active,
       windowId: t.windowId,
-    })),
-  };
+      groupId: t.groupId,
+      groupTitle: groupTitle,
+    });
+  }
+  return { tabs: tabList };
 }
 
 async function h_activateTab(params) {
@@ -522,6 +560,28 @@ async function h_finalizeTabs(params) {
   const { keep } = params;
   const keepSet = new Set(keep || []);
 
+  // 1. If tabGroupId is currently null (e.g. SW restarted), attempt to recover the active Shunt group first
+  if (tabGroupId == null) {
+    try {
+      const wins = await chrome.windows.getAll({ populate: true });
+      for (const win of wins) {
+        for (const tab of win.tabs ?? []) {
+          if (tab.groupId === chrome.tabGroups.TAB_GROUP_ID_NONE) continue;
+          const group = await chrome.tabGroups.get(tab.groupId);
+          if (group && group.title === "Shunt") {
+            tabGroupId = group.id;
+            groupWindowId = group.windowId;
+            if (tab.url === "about:blank") anchorTabId = tab.id;
+            break;
+          }
+        }
+        if (tabGroupId != null) break;
+      }
+    } catch {
+      /* ok */
+    }
+  }
+
   // Always protect the anchor tab — closing it would delete the entire group
   if (anchorTabId != null) {
     keepSet.add(anchorTabId);
@@ -546,6 +606,28 @@ async function h_finalizeTabs(params) {
         }
       }
     }
+  }
+
+  // Find and clean up any other duplicate/orphaned Shunt groups and their tabs
+  try {
+    const wins = await chrome.windows.getAll({ populate: true });
+    for (const win of wins) {
+      for (const tab of win.tabs ?? []) {
+        if (tab.groupId === chrome.tabGroups.TAB_GROUP_ID_NONE) continue;
+        try {
+          const group = await chrome.tabGroups.get(tab.groupId);
+          if (group && group.title === "Shunt" && group.id !== tabGroupId) {
+            if (!keepSet.has(tab.id)) {
+              await chrome.tabs.remove(tab.id);
+            }
+          }
+        } catch {
+          /* ok */
+        }
+      }
+    }
+  } catch {
+    /* ok */
   }
 
   return { kept: Array.from(keepSet) };
