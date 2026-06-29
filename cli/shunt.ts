@@ -152,7 +152,11 @@ class ShuntRPC {
       const timer = setTimeout(() => {
         cleanup();
         this.close();
-        reject(new Error(`RPC timeout waiting for ${method} (${RPC_TIMEOUT_MS}ms)`));
+        reject(new Error(
+          `RPC timeout waiting for ${method} (${RPC_TIMEOUT_MS}ms)\n` +
+            "Connected to /tmp/shunt.sock, but no response came back from the extension bridge.\n" +
+            "If shunt-host was started manually, kill stale shunt-host processes and reload the Helium extension.",
+        ));
       }, RPC_TIMEOUT_MS);
 
       const finish = (fn: () => void) => {

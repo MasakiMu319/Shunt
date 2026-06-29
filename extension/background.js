@@ -796,9 +796,10 @@ function connect() {
 
     nextPort.onDisconnect.addListener(async () => {
       if (port !== nextPort) return;
-      console.warn("shunt: host disconnected, triggering cleanup");
+      const reason = chrome.runtime.lastError?.message;
+      console.warn("shunt: host disconnected, triggering cleanup", reason ? `(${reason})` : "");
       stopHeartbeat();
-      await cleanup("native host disconnected");
+      await cleanup(reason ? `native host disconnected: ${reason}` : "native host disconnected");
       port = null;
       reconnectNative();
     });

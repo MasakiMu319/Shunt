@@ -7,18 +7,43 @@
 // Knows nothing about message content. Does not parse JSON.
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::net::UnixListener;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
 const SOCKET_PATH: &str = "/tmp/shunt.sock";
 const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024; // 16 MiB (Chrome caps at 1 MiB)
 
-fn main() {
-    // Clean up stale socket from previous run
-    let _ = std::fs::remove_file(SOCKET_PATH);
+fn bind_socket() -> UnixListener {
+    match UnixListener::bind(SOCKET_PATH) {
+        Ok(listener) => return listener,
+        Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => {
+            // Do not blindly unlink a live socket: a second manually-started host
+            // would steal /tmp/shunt.sock from the Chrome-spawned Native Messaging
+            // host and turn the CLI connection into a black hole.
+            match UnixStream::connect(SOCKET_PATH) {
+                Ok(_) => {
+                    eprintln!(
+                        "shunt-host: {SOCKET_PATH} is already served by another live host; exiting"
+                    );
+                    std::process::exit(1);
+                }
+                Err(connect_err) => {
+                    eprintln!(
+                        "shunt-host: removing stale socket {SOCKET_PATH} ({connect_err})"
+                    );
+                    std::fs::remove_file(SOCKET_PATH).expect("remove stale Unix socket");
+                }
+            }
+        }
+        Err(err) => panic!("bind Unix socket: {err}"),
+    }
 
-    let listener = UnixListener::bind(SOCKET_PATH).expect("bind Unix socket");
+    UnixListener::bind(SOCKET_PATH).expect("bind Unix socket after stale cleanup")
+}
+
+fn main() {
+    let listener = bind_socket();
     let clients: Arc<Mutex<Vec<std::os::unix::net::UnixStream>>> =
         Arc::new(Mutex::new(Vec::new()));
     let stdout: Arc<Mutex<std::io::Stdout>> = Arc::new(Mutex::new(std::io::stdout()));
