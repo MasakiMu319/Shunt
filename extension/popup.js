@@ -15,6 +15,10 @@ async function refresh() {
     const hostEl = $("host");
     hostEl.textContent = st.nativeHost;
     hostEl.className = `badge ${st.nativeHost === "connected" ? "badge-ok" : "badge-err"}`;
+    const native = st.nativeStatus || {};
+    $("watchdog").textContent = native.lastAttemptReason || "—";
+    $("last-connected").textContent = fmtTime(native.lastConnectedAt);
+    $("last-error").textContent = native.lastError || "—";
     // Window / Group
     $("win").textContent = st.groupWindowId ?? "—";
     $("grp").textContent = st.tabGroupId ?? "—";
@@ -43,12 +47,20 @@ async function refresh() {
     const hostEl = $("host");
     hostEl.textContent = "disconnected";
     hostEl.className = "badge badge-err";
-    $("tabs").innerHTML = `<span class="error">${eschtml(e.message)}</span>`;
+    $("watchdog").textContent = "popup-error";
+    $("last-connected").textContent = "—";
+    $("last-error").textContent = e.message || String(e);
+    $("tabs").innerHTML = `<span class="error">${eschtml(e.message || String(e))}</span>`;
   }
 }
 
+function fmtTime(ts) {
+  if (!ts) return "—";
+  return new Date(ts).toLocaleString();
+}
+
 function eschtml(s) {
-  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
 $("refresh").addEventListener("click", refresh);
