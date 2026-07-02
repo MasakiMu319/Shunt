@@ -9,6 +9,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -51,6 +52,28 @@ fn lock_path(socket_path: &Path) -> PathBuf {
     default_runtime_dir().join(LOCK_FILE_NAME)
 }
 
+#[derive(Clone, Copy)]
+struct SocketIdentity {
+    dev: u64,
+    ino: u64,
+}
+
+fn socket_identity(path: &Path) -> Option<SocketIdentity> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some(SocketIdentity {
+        dev: meta.dev(),
+        ino: meta.ino(),
+    })
+}
+
+fn remove_socket_if_owned(path: &Path, identity: Option<SocketIdentity>) {
+    let Some(expected) = identity else { return };
+    let Some(current) = socket_identity(path) else { return };
+    if current.dev == expected.dev && current.ino == expected.ino {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 fn acquire_socket_lock(lock_path: &Path, is_native: bool) -> File {
     if !is_native && !manual_host_allowed() {
         eprintln!(
@@ -84,7 +107,7 @@ fn acquire_socket_lock(lock_path: &Path, is_native: bool) -> File {
     lock
 }
 
-fn bind_socket(socket_path: &Path) -> UnixListener {
+fn bind_socket(socket_path: &Path) -> (UnixListener, Option<SocketIdentity>) {
     // The flock above is the ownership primitive. Once held, no other host can
     // concurrently probe/unlink/bind this socket path.
     if let Some(parent) = socket_path.parent() {
@@ -96,7 +119,9 @@ fn bind_socket(socket_path: &Path) -> UnixListener {
         Err(err) => panic!("remove stale Unix socket: {err}"),
     }
     thread::sleep(Duration::from_millis(10));
-    UnixListener::bind(socket_path).expect("bind Unix socket")
+    let listener = UnixListener::bind(socket_path).expect("bind Unix socket");
+    let identity = socket_identity(socket_path);
+    (listener, identity)
 }
 
 fn json_escape(value: &str) -> String {
@@ -138,7 +163,7 @@ fn main() {
     let socket_path = socket_path();
     let lock_path = lock_path(&socket_path);
     let _socket_lock = acquire_socket_lock(&lock_path, is_native);
-    let listener = bind_socket(&socket_path);
+    let (listener, socket_identity) = bind_socket(&socket_path);
     let clients: Arc<Mutex<Vec<(usize, std::os::unix::net::UnixStream)>>> =
         Arc::new(Mutex::new(Vec::new()));
     let next_client_id = Arc::new(AtomicUsize::new(1));
@@ -223,5 +248,5 @@ fn main() {
     }
 
     // stdin closed → cleanup
-    let _ = std::fs::remove_file(socket_path);
+    remove_socket_if_owned(&socket_path, socket_identity);
 }
