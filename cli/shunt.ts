@@ -5,8 +5,9 @@
  */
 
 import { randomUUID } from "node:crypto";
+import { accessSync, constants, existsSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { type Socket, createConnection } from "node:net";
 
 // ── Config ────────────────────────────────────────────────────────────────
@@ -18,6 +19,21 @@ function resolveSocketPath(): string {
 }
 
 const SOCKET_PATH = resolveSocketPath();
+
+function resolveLockPath(): string {
+  if (process.env.SHUNT_SOCKET_PATH) return `${SOCKET_PATH}.lock`;
+  return join(dirname(SOCKET_PATH), "shunt.sock.lock");
+}
+
+const LOCK_PATH = resolveLockPath();
+const MANIFEST_PATH = join(
+  homedir(),
+  "Library",
+  "Application Support",
+  "net.imput.helium",
+  "NativeMessagingHosts",
+  "com.opensetsuna.shunt.json",
+);
 
 const FETCH_TIMEOUT_MS = 15_000;
 const DEFUDDLE_MIN_CHARS = 200;
@@ -665,6 +681,93 @@ async function cmd_status(rpc: ShuntRPC) {
   }
 }
 
+function pass(label: string, detail?: string) {
+  console.log(`✅ ${label}${detail ? ` — ${detail}` : ""}`);
+}
+
+function warn(label: string, detail?: string) {
+  console.log(`⚠️  ${label}${detail ? ` — ${detail}` : ""}`);
+}
+
+function failCheck(label: string, detail?: string) {
+  console.log(`❌ ${label}${detail ? ` — ${detail}` : ""}`);
+}
+
+function fileMode(path: string): string {
+  try {
+    return `0${(statSync(path).mode & 0o777).toString(8)}`;
+  } catch {
+    return "?";
+  }
+}
+
+async function cmd_doctor(rpc: ShuntRPC) {
+  console.log("Shunt doctor\n");
+  console.log("Paths");
+  console.log(`  socket:   ${SOCKET_PATH}`);
+  console.log(`  lock:     ${LOCK_PATH}`);
+  console.log(`  manifest: ${MANIFEST_PATH}`);
+  console.log("");
+
+  if (existsSync(SOCKET_PATH)) {
+    try {
+      const stat = statSync(SOCKET_PATH);
+      if (stat.isSocket()) pass("socket exists", `mode=${fileMode(SOCKET_PATH)}`);
+      else failCheck("socket path exists but is not a socket", `mode=${fileMode(SOCKET_PATH)}`);
+    } catch (err) {
+      failCheck("socket stat failed", err instanceof Error ? err.message : String(err));
+    }
+  } else {
+    failCheck("socket missing", "extension/native host has not connected yet");
+  }
+
+  if (existsSync(LOCK_PATH)) {
+    const owner = readFileSync(LOCK_PATH, "utf-8").trim() || "empty";
+    pass("lock exists", owner);
+  } else {
+    warn("lock missing", "normal when host is not running");
+  }
+
+  let manifest: { path?: string; allowed_origins?: string[] } | null = null;
+  if (existsSync(MANIFEST_PATH)) {
+    try {
+      manifest = JSON.parse(readFileSync(MANIFEST_PATH, "utf-8"));
+      pass("native messaging manifest registered", manifest.path);
+    } catch (err) {
+      failCheck("native messaging manifest invalid", err instanceof Error ? err.message : String(err));
+    }
+  } else {
+    failCheck("native messaging manifest missing", "run `just register`");
+  }
+
+  if (manifest?.path) {
+    if (existsSync(manifest.path)) {
+      try {
+        accessSync(manifest.path, constants.X_OK);
+        pass("host binary executable", manifest.path);
+      } catch {
+        failCheck("host binary is not executable", `${manifest.path} mode=${fileMode(manifest.path)}`);
+      }
+    } else {
+      failCheck("host binary missing", manifest.path);
+    }
+    const allowed = manifest.allowed_origins?.join(", ") || "none";
+    console.log(`  allowed origins: ${allowed}`);
+  }
+
+  try {
+    const status = (await rpc.call("getStatus")) as Record<string, any>;
+    pass("extension RPC reachable", `nativeHost=${status.nativeHost ?? "?"}`);
+    const native = status.nativeStatus || {};
+    console.log(`  bridge state: ${native.state ?? "?"}`);
+    console.log(`  host pid:      ${native.hostPid ?? "?"}`);
+    console.log(`  host socket:   ${native.socketPath ?? "?"}`);
+    console.log(`  last error:    ${native.lastError ?? "none"}`);
+  } catch (err) {
+    failCheck("extension RPC unreachable", err instanceof Error ? err.message : String(err));
+  }
+}
+
 async function cmd_findElement(rpc: ShuntRPC, tabId: number, opts?: { text?: string; selector?: string }) {
   const params: Record<string, unknown> = { tabId };
   if (opts?.text) params.text = opts.text;
@@ -818,6 +921,7 @@ Commands:
   activate   <tabId>          Activate tab
   session                     Show session state
   status                      Connection health check
+  doctor                      Diagnose manifest, socket, host, and extension
   find-element <tabId> [--text TEXT] [--selector CSS]     Find DOM element
   get-text   <tabId> [--max-length N]                     Extract page text
   snapshot   <tabId> [-d N]                               AX tree snapshot
@@ -985,6 +1089,9 @@ async function main() {
 
       case "status":
         await cmd_status(rpc); break;
+
+      case "doctor":
+        await cmd_doctor(rpc); break;
 
       case "find-element": {
         const tid = Number(args[1]);
