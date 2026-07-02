@@ -21,6 +21,11 @@ const SOCKET_FILE_NAME: &str = "shunt.sock";
 const LOCK_FILE_NAME: &str = "shunt.sock.lock";
 const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024; // 16 MiB (Chrome caps at 1 MiB)
 
+fn fatal(message: impl std::fmt::Display) -> ! {
+    eprintln!("shunt-host: {message}");
+    std::process::exit(1);
+}
+
 fn is_native_messaging_launch() -> bool {
     std::env::args().any(|arg| arg.starts_with("chrome-extension://"))
 }
@@ -68,7 +73,9 @@ fn socket_identity(path: &Path) -> Option<SocketIdentity> {
 
 fn remove_socket_if_owned(path: &Path, identity: Option<SocketIdentity>) {
     let Some(expected) = identity else { return };
-    let Some(current) = socket_identity(path) else { return };
+    let Some(current) = socket_identity(path) else {
+        return;
+    };
     if current.dev == expected.dev && current.ino == expected.ino {
         let _ = std::fs::remove_file(path);
     }
@@ -84,26 +91,41 @@ fn acquire_socket_lock(lock_path: &Path, is_native: bool) -> File {
     }
 
     if let Some(parent) = lock_path.parent() {
-        std::fs::create_dir_all(parent).expect("create Shunt runtime directory");
+        if let Err(err) = std::fs::create_dir_all(parent) {
+            fatal(format!("create Shunt runtime directory: {err}"));
+        }
     }
 
-    let lock = OpenOptions::new()
+    let lock = match OpenOptions::new()
         .create(true)
         .read(true)
         .write(true)
         .truncate(true)
         .open(lock_path)
-        .expect("open socket lock");
+    {
+        Ok(lock) => lock,
+        Err(err) => fatal(format!("open socket lock: {err}")),
+    };
 
     let rc = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if rc != 0 {
-        eprintln!("shunt-host: another host owns {}; exiting", lock_path.display());
-        std::process::exit(1);
+        fatal(format!(
+            "another host owns {}; exiting",
+            lock_path.display()
+        ));
     }
 
-    lock.set_len(0).expect("truncate socket lock");
-    writeln!(&lock, "{}\t{}", std::process::id(), if is_native { "native" } else { "manual" })
-        .expect("write socket lock owner");
+    if let Err(err) = lock.set_len(0) {
+        fatal(format!("truncate socket lock: {err}"));
+    }
+    if let Err(err) = writeln!(
+        &lock,
+        "{}\t{}",
+        std::process::id(),
+        if is_native { "native" } else { "manual" }
+    ) {
+        fatal(format!("write socket lock owner: {err}"));
+    }
     lock
 }
 
@@ -111,15 +133,20 @@ fn bind_socket(socket_path: &Path) -> (UnixListener, Option<SocketIdentity>) {
     // The flock above is the ownership primitive. Once held, no other host can
     // concurrently probe/unlink/bind this socket path.
     if let Some(parent) = socket_path.parent() {
-        std::fs::create_dir_all(parent).expect("create Shunt runtime directory");
+        if let Err(err) = std::fs::create_dir_all(parent) {
+            fatal(format!("create Shunt runtime directory: {err}"));
+        }
     }
     match std::fs::remove_file(socket_path) {
         Ok(_) => {}
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => panic!("remove stale Unix socket: {err}"),
+        Err(err) => fatal(format!("remove stale Unix socket: {err}")),
     }
     thread::sleep(Duration::from_millis(10));
-    let listener = UnixListener::bind(socket_path).expect("bind Unix socket");
+    let listener = match UnixListener::bind(socket_path) {
+        Ok(listener) => listener,
+        Err(err) => fatal(format!("bind Unix socket: {err}")),
+    };
     let identity = socket_identity(socket_path);
     (listener, identity)
 }
@@ -142,7 +169,7 @@ fn json_escape(value: &str) -> String {
 
 fn write_native_message(stdout: &Arc<Mutex<std::io::Stdout>>, message: &str) {
     let len = message.len() as u32;
-    let mut out = stdout.lock().unwrap();
+    let Ok(mut out) = stdout.lock() else { return };
     out.write_all(&len.to_ne_bytes()).ok();
     out.write_all(message.as_bytes()).ok();
     out.flush().ok();
@@ -182,11 +209,22 @@ fn main() {
             };
 
             // Clone write end for broadcast list, keep read end for this thread
-            let write_stream = stream.try_clone().expect("clone stream");
+            let write_stream = match stream.try_clone() {
+                Ok(stream) => stream,
+                Err(err) => {
+                    eprintln!("shunt-host: clone client stream failed: {err}");
+                    continue;
+                }
+            };
             let read_stream = stream;
 
             let client_id = next_client_id_accept.fetch_add(1, Ordering::Relaxed);
-            clients_accept.lock().unwrap().push((client_id, write_stream));
+            if let Ok(mut clients) = clients_accept.lock() {
+                clients.push((client_id, write_stream));
+            } else {
+                eprintln!("shunt-host: clients mutex poisoned");
+                continue;
+            }
 
             // Per-client reader: socket → stdout, adding 4-byte native-endian length prefix
             let clients_cleanup = clients_accept.clone();
@@ -204,7 +242,7 @@ fn main() {
                                 continue;
                             }
                             let len = msg.len() as u32;
-                            let mut out = stdout.lock().unwrap();
+                            let Ok(mut out) = stdout.lock() else { break };
                             // Write 4-byte length prefix (native byte order) + message body
                             out.write_all(&len.to_ne_bytes()).ok();
                             out.write_all(msg).ok();
@@ -212,7 +250,9 @@ fn main() {
                         }
                     }
                 }
-                clients_cleanup.lock().unwrap().retain(|(id, _)| *id != client_id);
+                if let Ok(mut clients) = clients_cleanup.lock() {
+                    clients.retain(|(id, _)| *id != client_id);
+                }
             });
         }
     });
@@ -241,10 +281,10 @@ fn main() {
         }
 
         // Broadcast to all connected socket clients (append newline for line-based reading)
-        let mut clients = clients.lock().unwrap();
-        clients.retain_mut(|(_, c)| {
-            c.write_all(&body).and_then(|_| c.write_all(b"\n")).is_ok()
-        });
+        let Ok(mut clients) = clients.lock() else {
+            break;
+        };
+        clients.retain_mut(|(_, c)| c.write_all(&body).and_then(|_| c.write_all(b"\n")).is_ok());
     }
 
     // stdin closed → cleanup
