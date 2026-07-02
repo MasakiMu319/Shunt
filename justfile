@@ -28,9 +28,9 @@ unregister:
 
 # ─── Test ─────────────────────────────────────────────
 
-# Test Native Host transport (requires running host manually)
+# Test CLI connectivity through the browser-backed native host
 test-host:
-    echo '{"type":"ping"}' | nc -U /tmp/shunt.sock
+    cd cli && bun shunt.ts ping
 
 # ─── Code Quality ─────────────────────────────────────
 

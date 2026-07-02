@@ -5,11 +5,19 @@
  */
 
 import { randomUUID } from "node:crypto";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { type Socket, createConnection } from "node:net";
 
 // ── Config ────────────────────────────────────────────────────────────────
 
-const SOCKET_PATH = "/tmp/shunt.sock";
+function resolveSocketPath(): string {
+  if (process.env.SHUNT_SOCKET_PATH) return process.env.SHUNT_SOCKET_PATH;
+  if (process.env.SHUNT_RUNTIME_DIR) return join(process.env.SHUNT_RUNTIME_DIR, "shunt.sock");
+  return join(homedir(), "Library", "Application Support", "Shunt", "shunt.sock");
+}
+
+const SOCKET_PATH = resolveSocketPath();
 
 const FETCH_TIMEOUT_MS = 15_000;
 const DEFUDDLE_MIN_CHARS = 200;
@@ -154,7 +162,7 @@ class ShuntRPC {
         this.close();
         reject(new Error(
           `RPC timeout waiting for ${method} (${RPC_TIMEOUT_MS}ms)\n` +
-            "Connected to /tmp/shunt.sock, but no response came back from the extension bridge.\n" +
+            `Connected to ${SOCKET_PATH}, but no response came back from the extension bridge.\n` +
             "If shunt-host was started manually, kill stale shunt-host processes and reload the Helium extension.",
         ));
       }, RPC_TIMEOUT_MS);

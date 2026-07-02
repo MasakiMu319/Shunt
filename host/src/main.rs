@@ -10,13 +10,14 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixListener;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-const SOCKET_PATH: &str = "/tmp/shunt.sock";
-const LOCK_PATH: &str = "/tmp/shunt.sock.lock";
+const SOCKET_FILE_NAME: &str = "shunt.sock";
+const LOCK_FILE_NAME: &str = "shunt.sock.lock";
 const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024; // 16 MiB (Chrome caps at 1 MiB)
 
 fn is_native_messaging_launch() -> bool {
@@ -27,7 +28,30 @@ fn manual_host_allowed() -> bool {
     std::env::var("SHUNT_ALLOW_MANUAL_HOST").is_ok_and(|value| value == "1")
 }
 
-fn acquire_socket_lock(is_native: bool) -> File {
+fn default_runtime_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("SHUNT_RUNTIME_DIR") {
+        return PathBuf::from(dir);
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        return PathBuf::from(home).join("Library/Application Support/Shunt");
+    }
+    std::env::temp_dir().join("Shunt")
+}
+
+fn socket_path() -> PathBuf {
+    std::env::var("SHUNT_SOCKET_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| default_runtime_dir().join(SOCKET_FILE_NAME))
+}
+
+fn lock_path(socket_path: &Path) -> PathBuf {
+    if std::env::var("SHUNT_SOCKET_PATH").is_ok() {
+        return PathBuf::from(format!("{}.lock", socket_path.display()));
+    }
+    default_runtime_dir().join(LOCK_FILE_NAME)
+}
+
+fn acquire_socket_lock(lock_path: &Path, is_native: bool) -> File {
     if !is_native && !manual_host_allowed() {
         eprintln!(
             "shunt-host: refusing manual launch; start Helium with the Shunt extension instead \
@@ -36,17 +60,21 @@ fn acquire_socket_lock(is_native: bool) -> File {
         std::process::exit(1);
     }
 
+    if let Some(parent) = lock_path.parent() {
+        std::fs::create_dir_all(parent).expect("create Shunt runtime directory");
+    }
+
     let lock = OpenOptions::new()
         .create(true)
         .read(true)
         .write(true)
         .truncate(true)
-        .open(LOCK_PATH)
+        .open(lock_path)
         .expect("open socket lock");
 
     let rc = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if rc != 0 {
-        eprintln!("shunt-host: another host owns {LOCK_PATH}; exiting");
+        eprintln!("shunt-host: another host owns {}; exiting", lock_path.display());
         std::process::exit(1);
     }
 
@@ -56,22 +84,27 @@ fn acquire_socket_lock(is_native: bool) -> File {
     lock
 }
 
-fn bind_socket() -> UnixListener {
+fn bind_socket(socket_path: &Path) -> UnixListener {
     // The flock above is the ownership primitive. Once held, no other host can
     // concurrently probe/unlink/bind this socket path.
-    match std::fs::remove_file(SOCKET_PATH) {
+    if let Some(parent) = socket_path.parent() {
+        std::fs::create_dir_all(parent).expect("create Shunt runtime directory");
+    }
+    match std::fs::remove_file(socket_path) {
         Ok(_) => {}
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
         Err(err) => panic!("remove stale Unix socket: {err}"),
     }
     thread::sleep(Duration::from_millis(10));
-    UnixListener::bind(SOCKET_PATH).expect("bind Unix socket")
+    UnixListener::bind(socket_path).expect("bind Unix socket")
 }
 
 fn main() {
     let is_native = is_native_messaging_launch();
-    let _socket_lock = acquire_socket_lock(is_native);
-    let listener = bind_socket();
+    let socket_path = socket_path();
+    let lock_path = lock_path(&socket_path);
+    let _socket_lock = acquire_socket_lock(&lock_path, is_native);
+    let listener = bind_socket(&socket_path);
     let clients: Arc<Mutex<Vec<(usize, std::os::unix::net::UnixStream)>>> =
         Arc::new(Mutex::new(Vec::new()));
     let next_client_id = Arc::new(AtomicUsize::new(1));
@@ -155,5 +188,5 @@ fn main() {
     }
 
     // stdin closed → cleanup
-    let _ = std::fs::remove_file(SOCKET_PATH);
+    let _ = std::fs::remove_file(socket_path);
 }

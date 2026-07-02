@@ -42,6 +42,9 @@ just register          # Register Native Messaging host
 # Load extension/ as unpacked in Helium
 ```
 
+By default, the CLI/host socket lives at `~/Library/Application Support/Shunt/shunt.sock`.
+Set `SHUNT_SOCKET_PATH` to override it for debugging.
+
 ## Why not agent-browser
 
 - No separate headless process. Tabs live in user's Helium profile inside a collapsed tab group.
