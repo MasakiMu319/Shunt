@@ -99,6 +99,40 @@ fn bind_socket(socket_path: &Path) -> UnixListener {
     UnixListener::bind(socket_path).expect("bind Unix socket")
 }
 
+fn json_escape(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            c if c.is_control() => escaped.push_str(&format!("\\u{:04x}", c as u32)),
+            c => escaped.push(c),
+        }
+    }
+    escaped
+}
+
+fn write_native_message(stdout: &Arc<Mutex<std::io::Stdout>>, message: &str) {
+    let len = message.len() as u32;
+    let mut out = stdout.lock().unwrap();
+    out.write_all(&len.to_ne_bytes()).ok();
+    out.write_all(message.as_bytes()).ok();
+    out.flush().ok();
+}
+
+fn send_host_ready(stdout: &Arc<Mutex<std::io::Stdout>>, socket_path: &Path) {
+    let socket_path = json_escape(&socket_path.display().to_string());
+    let message = format!(
+        "{{\"jsonrpc\":\"2.0\",\"method\":\"hostReady\",\"params\":{{\"pid\":{},\"socketPath\":\"{}\"}}}}",
+        std::process::id(),
+        socket_path,
+    );
+    write_native_message(stdout, &message);
+}
+
 fn main() {
     let is_native = is_native_messaging_launch();
     let socket_path = socket_path();
@@ -109,6 +143,7 @@ fn main() {
         Arc::new(Mutex::new(Vec::new()));
     let next_client_id = Arc::new(AtomicUsize::new(1));
     let stdout: Arc<Mutex<std::io::Stdout>> = Arc::new(Mutex::new(std::io::stdout()));
+    send_host_ready(&stdout, &socket_path);
 
     // ── Accept thread: accept socket connections, spawn per-client reader ──
     let clients_accept = clients.clone();

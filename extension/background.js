@@ -718,13 +718,17 @@ const handlers = {
 };
 
 // Notification handlers (one-way, no id)
-function handleNotification(msg) {
-  const { method } = msg;
+function handleNotification(msg, responsePort) {
+  const { method, params } = msg;
   switch (method) {
     case "heartbeat":
       lastHeartbeat = Date.now();
       break;
-    // Add more notification handlers here
+    case "hostReady":
+      confirmNativeConnected(responsePort, "host-ready", params || {});
+      break;
+    default:
+      break;
   }
 }
 
@@ -737,7 +741,7 @@ async function handleRequest(msg, responsePort) {
   recordNativeActivity();
   const { id, method, params } = msg;
   if (id == null) {
-    handleNotification(msg);
+    handleNotification(msg, responsePort);
     return;
   }
   const handler = handlers[method];
@@ -851,7 +855,7 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
 const NATIVE_RECONNECT_NAME = "shunt-native-reconnect";
 const NATIVE_RECONNECT_PERIOD = 30; // seconds — MV3 alarms must be at least 30s
 const NATIVE_STATUS_KEY = "shuntNativeStatus";
-const NATIVE_CONFIRM_DELAY_MS = 500;
+const NATIVE_HANDSHAKE_TIMEOUT_MS = 5_000;
 const NATIVE_RETRY_INITIAL_MS = 1_000;
 const NATIVE_RETRY_MAX_MS = 30_000;
 
@@ -864,10 +868,12 @@ const nativeStatus = {
   lastConnectedAt: null,
   lastDisconnectedAt: null,
   lastError: null,
+  hostPid: null,
+  socketPath: null,
 };
 
 let nativeStatusReady = null;
-let nativeConfirmTimer = null;
+let nativeHandshakeTimer = null;
 let nativeRetryTimer = null;
 let nativeRetryDelayMs = NATIVE_RETRY_INITIAL_MS;
 
@@ -904,10 +910,10 @@ function ensureNativeWatchdog() {
   chrome.alarms.create(NATIVE_RECONNECT_NAME, { periodInMinutes: NATIVE_RECONNECT_PERIOD / 60 });
 }
 
-function clearNativeConfirmTimer() {
-  if (nativeConfirmTimer != null) {
-    clearTimeout(nativeConfirmTimer);
-    nativeConfirmTimer = null;
+function clearNativeHandshakeTimer() {
+  if (nativeHandshakeTimer != null) {
+    clearTimeout(nativeHandshakeTimer);
+    nativeHandshakeTimer = null;
   }
 }
 
@@ -929,14 +935,17 @@ function scheduleNativeRetry(reason = "retry") {
   }, delayMs);
 }
 
-function confirmNativeConnected(nextPort, reason) {
+function confirmNativeConnected(nextPort, reason, params = {}) {
   if (port !== nextPort) return;
+  clearNativeHandshakeTimer();
   nativeRetryDelayMs = NATIVE_RETRY_INITIAL_MS;
   persistNativeStatus({
     state: "connected",
     lastConnectedAt: Date.now(),
     lastAttemptReason: reason,
     lastError: null,
+    hostPid: params.pid ?? null,
+    socketPath: params.socketPath ?? null,
   });
   startHeartbeat();
   console.log("shunt: connected");
@@ -971,7 +980,7 @@ function connect(reason = "manual") {
         "shunt: host disconnected, triggering cleanup",
         disconnectReason ? `(${disconnectReason})` : "",
       );
-      clearNativeConfirmTimer();
+      clearNativeHandshakeTimer();
       stopHeartbeat();
       await cleanup(
         disconnectReason
@@ -987,11 +996,22 @@ function connect(reason = "manual") {
       scheduleNativeRetry("disconnect");
     });
 
-    clearNativeConfirmTimer();
-    nativeConfirmTimer = setTimeout(
-      () => confirmNativeConnected(nextPort, reason),
-      NATIVE_CONFIRM_DELAY_MS,
-    );
+    clearNativeHandshakeTimer();
+    nativeHandshakeTimer = setTimeout(() => {
+      if (port !== nextPort) return;
+      persistNativeStatus({
+        state: "disconnected",
+        lastDisconnectedAt: Date.now(),
+        lastError: "native host handshake timeout",
+      });
+      port = null;
+      try {
+        nextPort.disconnect();
+      } catch {
+        /* ok */
+      }
+      scheduleNativeRetry("handshake-timeout");
+    }, NATIVE_HANDSHAKE_TIMEOUT_MS);
   } catch (err) {
     port = null;
     const message = err?.message || String(err);
