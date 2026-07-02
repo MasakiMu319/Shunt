@@ -820,7 +820,6 @@ function h_ping() {
 
 chrome.alarms.onAlarm.addListener(async (alarm) => {
   if (alarm.name === NATIVE_RECONNECT_NAME) {
-    scheduleNativeReconnect();
     connect("watchdog");
     return;
   }
@@ -853,8 +852,12 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
 const NATIVE_RECONNECT_NAME = "shunt-native-reconnect";
 const NATIVE_RECONNECT_PERIOD = 30; // seconds — MV3 alarms must be at least 30s
 const NATIVE_STATUS_KEY = "shuntNativeStatus";
+const NATIVE_CONFIRM_DELAY_MS = 500;
+const NATIVE_RETRY_INITIAL_MS = 1_000;
+const NATIVE_RETRY_MAX_MS = 30_000;
 
 const nativeStatus = {
+  state: "disconnected",
   connected: false,
   updatedAt: null,
   lastAttemptAt: null,
@@ -864,14 +867,29 @@ const nativeStatus = {
   lastError: null,
 };
 
-try {
-  chrome.storage.local.get(NATIVE_STATUS_KEY, (items) => {
-    if (items?.[NATIVE_STATUS_KEY]) {
-      Object.assign(nativeStatus, items[NATIVE_STATUS_KEY], { connected: !!port });
+let nativeStatusReady = null;
+let nativeConfirmTimer = null;
+let nativeRetryTimer = null;
+let nativeRetryDelayMs = NATIVE_RETRY_INITIAL_MS;
+
+function restoreNativeStatus() {
+  if (nativeStatusReady) return nativeStatusReady;
+  nativeStatusReady = new Promise((resolve) => {
+    try {
+      chrome.storage.local.get(NATIVE_STATUS_KEY, (items) => {
+        if (items?.[NATIVE_STATUS_KEY]) {
+          Object.assign(nativeStatus, items[NATIVE_STATUS_KEY], {
+            state: port ? nativeStatus.state : "disconnected",
+            connected: !!port,
+          });
+        }
+        resolve();
+      });
+    } catch {
+      resolve();
     }
   });
-} catch {
-  /* storage may be unavailable during startup */
+  return nativeStatusReady;
 }
 
 function persistNativeStatus(patch) {
@@ -883,36 +901,63 @@ function persistNativeStatus(patch) {
   }
 }
 
-function scheduleNativeReconnect() {
+function ensureNativeWatchdog() {
   chrome.alarms.create(NATIVE_RECONNECT_NAME, { periodInMinutes: NATIVE_RECONNECT_PERIOD / 60 });
 }
 
-function reconnectNative(reason = "disconnect") {
-  scheduleNativeReconnect();
-  connect(reason);
+function clearNativeConfirmTimer() {
+  if (nativeConfirmTimer != null) {
+    clearTimeout(nativeConfirmTimer);
+    nativeConfirmTimer = null;
+  }
+}
+
+function clearNativeRetryTimer() {
+  if (nativeRetryTimer != null) {
+    clearTimeout(nativeRetryTimer);
+    nativeRetryTimer = null;
+  }
+}
+
+function scheduleNativeRetry(reason = "retry") {
+  ensureNativeWatchdog();
+  if (port || nativeRetryTimer != null) return;
+  const delayMs = nativeRetryDelayMs;
+  nativeRetryDelayMs = Math.min(nativeRetryDelayMs * 2, NATIVE_RETRY_MAX_MS);
+  nativeRetryTimer = setTimeout(() => {
+    nativeRetryTimer = null;
+    connect(reason);
+  }, delayMs);
+}
+
+function confirmNativeConnected(nextPort, reason) {
+  if (port !== nextPort) return;
+  nativeRetryDelayMs = NATIVE_RETRY_INITIAL_MS;
+  persistNativeStatus({
+    state: "connected",
+    lastConnectedAt: Date.now(),
+    lastAttemptReason: reason,
+    lastError: null,
+  });
+  startHeartbeat();
+  console.log("shunt: connected");
 }
 
 function connect(reason = "manual") {
-  scheduleNativeReconnect();
-  if (port) {
-    persistNativeStatus({ lastAttemptReason: reason, lastError: null });
-    return;
-  }
+  ensureNativeWatchdog();
+  if (port) return;
+  if (nativeRetryTimer != null && reason === "watchdog") return;
 
+  clearNativeRetryTimer();
   persistNativeStatus({
+    state: "connecting",
     lastAttemptAt: Date.now(),
     lastAttemptReason: reason,
-    lastError: null,
   });
 
   try {
     const nextPort = chrome.runtime.connectNative("com.opensetsuna.shunt");
     port = nextPort;
-    persistNativeStatus({
-      lastConnectedAt: Date.now(),
-      lastAttemptReason: reason,
-      lastError: null,
-    });
 
     nextPort.onMessage.addListener((msg) => {
       handleRequest(msg, nextPort).catch((err) => {
@@ -927,6 +972,7 @@ function connect(reason = "manual") {
         "shunt: host disconnected, triggering cleanup",
         disconnectReason ? `(${disconnectReason})` : "",
       );
+      clearNativeConfirmTimer();
       stopHeartbeat();
       await cleanup(
         disconnectReason
@@ -935,20 +981,28 @@ function connect(reason = "manual") {
       );
       port = null;
       persistNativeStatus({
+        state: "disconnected",
         lastDisconnectedAt: Date.now(),
         lastError: disconnectReason,
       });
-      reconnectNative("disconnect");
+      scheduleNativeRetry("disconnect");
     });
 
-    startHeartbeat();
-    console.log("shunt: connected");
+    clearNativeConfirmTimer();
+    nativeConfirmTimer = setTimeout(
+      () => confirmNativeConnected(nextPort, reason),
+      NATIVE_CONFIRM_DELAY_MS,
+    );
   } catch (err) {
     port = null;
     const message = err?.message || String(err);
-    persistNativeStatus({ lastDisconnectedAt: Date.now(), lastError: message });
+    persistNativeStatus({
+      state: "disconnected",
+      lastDisconnectedAt: Date.now(),
+      lastError: message,
+    });
     console.error("shunt: connect failed", err);
-    scheduleNativeReconnect();
+    scheduleNativeRetry("connect-failed");
   }
 }
 
@@ -988,15 +1042,20 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 // ═══════════════════════════════════════════════════════════════
 // Startup
 // ═══════════════════════════════════════════════════════════════
-function bootNative(reason) {
-  scheduleNativeReconnect();
+async function bootNative(reason) {
+  await restoreNativeStatus();
+  ensureNativeWatchdog();
   connect(reason);
 }
 
-chrome.runtime.onStartup?.addListener(() => bootNative("startup"));
-chrome.runtime.onInstalled?.addListener(() => bootNative("installed"));
+chrome.runtime.onStartup?.addListener(() => {
+  bootNative("startup").catch((err) => console.error("shunt: startup boot failed", err));
+});
+chrome.runtime.onInstalled?.addListener(() => {
+  bootNative("installed").catch((err) => console.error("shunt: installed boot failed", err));
+});
 chrome.runtime.onSuspend?.addListener(() => {
   persistNativeStatus({ lastAttemptReason: "suspend" });
 });
 
-bootNative("service-worker-load");
+bootNative("service-worker-load").catch((err) => console.error("shunt: boot failed", err));
